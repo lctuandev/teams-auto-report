@@ -1,0 +1,26 @@
+{
+  "name": "teams-daily-report-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Automate Microsoft Teams daily report parent posts and replies.",
+  "type": "commonjs",
+  "main": "auto_report.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node auto_report.js",
+    "watch": "node auto_report.js --watch",
+    "check": "node --check auto_report.js",
+    "dry-run": "node auto_report.js --dry-run",
+    "test-auth:spaces": "node auto_report.js --test-auth spaces",
+    "test-auth:substrate": "node auto_report.js --test-auth substrate",
+    "test-auth:ic3": "node auto_report.js --test-auth ic3"
+  },
+  "keywords": [
+    "teams",
+    "automation",
+    "report"
+  ],
+  "license": "UNLICENSED"
+}

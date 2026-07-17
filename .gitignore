@@ -1,0 +1,12 @@
+.env
+token.json
+tokens/
+env.json
+members/*.json
+.locks/
+*.tmp
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*

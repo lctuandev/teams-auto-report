@@ -1,0 +1,136 @@
+{
+  "_notes": {
+    "copyTo": "Copy file nay thanh members/<member_id>.json roi dien thong tin rieng cua tung nguoi.",
+    "importantFields": [
+      "id",
+      "enabled",
+      "auth.common.clientId",
+      "auth.common.brkClientId",
+      "auth.common.anchorMailbox",
+      "auth.common.refreshToken",
+      "teams.threadId",
+      "teams.teamId",
+      "author.from",
+      "author.fromUserId",
+      "author.displayName",
+      "schedule",
+      "tasks"
+    ],
+    "fieldGuide": {
+      "auth.common.clientId": "Client id trong token request. Neu dung Teams web mac dinh thi thuong la 5e3ce6c0-2b1f-4285-8d4b-75ee78787346.",
+      "auth.common.brkClientId": "Gia tri brk_client_id trong token request neu request co brk fields. Thuong giong Teams web client id.",
+      "auth.common.anchorMailbox": "Gia tri X-AnchorMailbox trong token/search request, dang Oid:<user-oid>@<tenant-id>.",
+      "auth.common.refreshToken": "Refresh token lay tu request oauth2/v2.0/token cua Teams web client 5e3ce6c0. Token nay co the dung de doi sang spaces/substrate/ic3 bang scope rieng.",
+      "author.from": "Gia tri from trong payload post/reply Teams, dang 8:orgid:<user-oid>.",
+      "author.fromUserId": "Thuong giong author.from. Neu khong dien, script se fallback ve author.from.",
+      "teams.threadId": "Conversation/channel thread id trong URL/API chatsvc, dang 19:...@thread.tacv2.",
+      "teams.teamId": "Team id trong API/list posts/search query, dang 19:...@thread.tacv2."
+    },
+    "tokenGuide": {
+      "primaryRefreshToken": "Uu tien lay refresh_token trong response cua request token co client_id=5e3ce6c0-2b1f-4285-8d4b-75ee78787346. Scope co the la api.spaces.skype.com hoac substrate.office.com.",
+      "spaces": "Script se dung primary refresh token de lay access token aud=https://api.spaces.skype.com.",
+      "substrate": "Script se dung primary refresh token de lay access token aud=https://substrate.office.com, dung de search parent post.",
+      "ic3": "Script se dung primary refresh token de lay access token aud=https://ic3.teams.office.com va scp=Teams.AccessAsUser.All, dung de tao parent post va reply report.",
+      "fallback": "Neu mot profile test-auth fail, them refreshToken rieng vao auth.<profile>.refreshToken.",
+      "firstRun": "Truong auth.<profile>.token se duoc script tu ghi lai sau khi refresh thanh cong."
+    },
+    "progressGuide": {
+      "startPercent": "Phan tram hien tai truoc khi cong tien do cho ngay report.",
+      "dailyIncreaseRange": "Moi ngay random mot gia tri trong khoang nay va luu vao dailyPlans[date].taskIncreases.",
+      "progressAppliedTasks": "Script tu tao dailyPlans[date].progressAppliedTasks sau khi post thanh cong de khong cong trung."
+    }
+  },
+  "id": "your_member_id",
+  "enabled": true,
+  "auth": {
+    "common": {
+      "clientId": "5e3ce6c0-2b1f-4285-8d4b-75ee78787346",
+      "redirectUri": "https://teams.cloud.microsoft/v2/authv2",
+      "brkClientId": "5e3ce6c0-2b1f-4285-8d4b-75ee78787346",
+      "brkRedirectUri": "https://teams.cloud.microsoft/v2/authv2",
+      "includeBrkFields": false,
+      "anchorMailbox": "Oid:<user-oid>@<tenant-id>",
+      "refreshToken": "PASTE_TEAMS_WEB_REFRESH_TOKEN_HERE"
+    },
+    "spaces": {
+      "scope": "https://api.spaces.skype.com/.default openid profile offline_access",
+      "storeTokenInMember": true,
+      "reusePrimaryRefreshToken": true
+    },
+    "substrate": {
+      "scope": "https://substrate.office.com/.default openid profile offline_access",
+      "storeTokenInMember": true,
+      "reusePrimaryRefreshToken": true
+    },
+    "ic3": {
+      "scope": "https://ic3.teams.office.com/.default openid profile offline_access",
+      "storeTokenInMember": true,
+      "reusePrimaryRefreshToken": true,
+      "claims": {
+        "access_token": {
+          "xms_cc": {
+            "values": [
+              "CP1"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "teams": {
+    "threadId": "19:<channel-thread-id>@thread.tacv2",
+    "teamId": "19:<team-id>@thread.tacv2",
+    "conversationLinkPrefix": "https://teams.cloud.microsoft/l/message",
+    "searchTitleTemplate": "ADVANCE UAV NAVIGATION SYSTEM - Bao cao ngay {DD}/{MM}/{YYYY}",
+    "parentPostContentTemplate": "<p>ADVANCE UAV NAVIGATION SYSTEM - Bao cao ngay {DD}/{MM}/{YYYY}</p>"
+  },
+  "author": {
+    "from": "8:orgid:<user-oid>",
+    "fromUserId": "8:orgid:<user-oid>",
+    "displayName": "Your Display Name"
+  },
+  "schedule": {
+    "timezone": "Asia/Bangkok",
+    "days": [
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "parentPostAfterTime": "17:25",
+    "postAfterTime": "17:30",
+    "postAfterRandomWindowMinutes": 20
+  },
+  "report": {
+    "numberTemplate": "{DAY_INDEX}",
+    "progressStartDate": "2026-07-01",
+    "countProgressByWorkdaysOnly": true
+  },
+  "tasks": [
+    {
+      "title": "Hoan thien tinh nang A",
+      "startPercent": 0,
+      "dailyIncreaseRange": [
+        5,
+        10
+      ],
+      "maxPercent": 100
+    },
+    {
+      "title": "Kiem thu va sua loi tinh nang B",
+      "startPercent": 20,
+      "dailyIncrease": 5,
+      "maxPercent": 100
+    }
+  ],
+  "pending": [
+    "Dang cho review API tu team lien quan"
+  ],
+  "innovations": [
+    "Toi uu cach kiem tra tien do de han che lap noi dung moi ngay"
+  ],
+  "parentPosts": {},
+  "postedReports": {},
+  "dailyPlans": {}
+}

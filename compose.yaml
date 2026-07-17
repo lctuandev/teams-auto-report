@@ -1,0 +1,12 @@
+services:
+  teams-report:
+    build:
+      context: .
+    container_name: teams-daily-report-bot
+    restart: unless-stopped
+    working_dir: /app
+    command: npm run watch
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./members:/app/members
+      - ./.locks:/app/.locks
