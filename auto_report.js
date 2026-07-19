@@ -854,7 +854,59 @@ async function refreshAccessToken(refreshToken, config = {}, authKey = "auth") {
     body: request.body
   });
 
-  return normalizeTokenResponse(response, refreshToken);
+  const token = normalizeTokenResponse(response, refreshToken);
+  logTokenExpiry(config, authKey, token);
+  return token;
+}
+
+function logTokenExpiry(config = {}, authKey = "auth", token = {}) {
+  console.log(
+    [
+      `[INFO][${config.id || "member"}][${normalizeAuthKey(authKey)}] Token refreshed.`,
+      `accessTokenExpiresAt=${formatExpiryForLog(token.expiresAt)}`,
+      `refreshTokenExpiresAt=${formatExpiryForLog(token.refreshTokenExpiresAt)}`
+    ].join(" ")
+  );
+}
+
+function formatExpiryForLog(expiresAt) {
+  if (!expiresAt) {
+    return "unknown";
+  }
+
+  const expiresTime = new Date(expiresAt).getTime();
+  if (!Number.isFinite(expiresTime)) {
+    return String(expiresAt);
+  }
+
+  return `${new Date(expiresTime).toISOString()} (${formatMsRemaining(expiresTime - Date.now())})`;
+}
+
+function formatMsRemaining(ms) {
+  const expired = ms < 0;
+  let remainingSeconds = Math.max(0, Math.floor(Math.abs(ms) / 1000));
+  const days = Math.floor(remainingSeconds / 86400);
+  remainingSeconds %= 86400;
+  const hours = Math.floor(remainingSeconds / 3600);
+  remainingSeconds %= 3600;
+  const minutes = Math.floor(remainingSeconds / 60);
+  const seconds = remainingSeconds % 60;
+  const prefix = expired ? "expired " : "in ";
+  const suffix = expired ? " ago" : "";
+
+  if (days > 0) {
+    return `${prefix}${days}d ${hours}h ${minutes}m${suffix}`;
+  }
+
+  if (hours > 0) {
+    return `${prefix}${hours}h ${minutes}m${suffix}`;
+  }
+
+  if (minutes > 0) {
+    return `${prefix}${minutes}m ${seconds}s${suffix}`;
+  }
+
+  return `${prefix}${seconds}s${suffix}`;
 }
 
 function buildRefreshTokenUrl(rawUrl, config = {}, authKey = "auth") {
