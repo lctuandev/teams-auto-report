@@ -10,3 +10,4 @@ services:
       - ./.env:/app/.env:ro
       - ./members:/app/members
       - ./.locks:/app/.locks
+      - ./.state:/app/.state

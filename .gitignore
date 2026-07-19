@@ -3,8 +3,12 @@ token.json
 tokens/
 env.json
 members/*.json
+members/*/config.json
+members/*/state.json
 .locks/
+.state/
 *.tmp
+tmp.json
 node_modules/
 npm-debug.log*
 yarn-debug.log*

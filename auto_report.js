@@ -6,6 +6,8 @@ const { spawn } = require("child_process");
 const ROOT = __dirname;
 const EMPTY_CELL = "&nbsp;";
 const AUTH_KEEPALIVE_PROFILES = ["spaces", "substrate", "ic3"];
+const PARENT_POST_CACHE_FILE = path.join(ROOT, ".state", "parent-posts.json");
+const MEMBER_STATE_KEYS = ["parentPosts", "postedReports", "dailyPlans"];
 const DAY_INDEX = {
   sunday: 0,
   sun: 0,
@@ -50,7 +52,6 @@ main().catch((error) => {
 
 async function main() {
   loadDotEnv(path.join(ROOT, ".env"));
-  loadJsonEnv(path.join(ROOT, "env.json"));
 
   const args = parseArgs(process.argv.slice(2));
 
@@ -65,7 +66,7 @@ async function main() {
     for (const member of members) {
       const authKey = typeof args["test-auth"] === "string" ? args["test-auth"] : "auth";
       const token = await getAccessToken(member.config, authKey);
-      writeJson(member.filePath, member.config);
+      persistMember(member);
       console.log(`[INFO][${member.config.id}][${authKey}] Auth OK. Access token length: ${token.length}.`);
     }
     return;
@@ -95,7 +96,6 @@ async function main() {
 }
 
 async function runPipelineForMember(member, args) {
-  const tasksFilePath = member.filePath;
   const config = member.config;
   const dryRun = Boolean(args["dry-run"] || args.dryRun);
   const force = Boolean(args.force);
@@ -110,18 +110,18 @@ async function runPipelineForMember(member, args) {
   if (!force && !dryRun) {
     const refreshedProfiles = await refreshAuthProfilesIfNeeded(config);
     if (refreshedProfiles.length) {
-      writeJson(tasksFilePath, config);
+      persistMember(member);
       console.log(`[INFO][${config.id}] Refreshed auth profile(s): ${refreshedProfiles.join(", ")}.`);
     }
   }
 
   if (!force && !dryRun) {
-    if (ensureDailyPlan(config, reportDate)) {
-      writeJson(tasksFilePath, config);
-    }
     pipelineStage = getPipelineStage(config, reportDate, now, timezone);
     if (pipelineStage === "skip") {
       return;
+    }
+    if (ensureDailyPlan(config, reportDate)) {
+      persistMember(member);
     }
     if (isReportAlreadyPosted(config, reportDateIso)) {
       return;
@@ -142,7 +142,7 @@ async function runPipelineForMember(member, args) {
   } else {
     accessToken = await getAccessToken(config, postProfileKey);
     if (!dryRun) {
-      writeJson(tasksFilePath, config);
+      persistMember(member);
     }
     console.log(`[INFO][${config.id}] Searching parent post: ${title}`);
     const parentPostResult = await withAuthRetry(
@@ -156,7 +156,7 @@ async function runPipelineForMember(member, args) {
     accessToken = parentPostResult.accessToken;
     parentPost = parentPostResult.value;
     if (!dryRun && parentPost.createdOrFound) {
-      writeJson(tasksFilePath, config);
+      persistMember(member);
     }
   }
 
@@ -174,7 +174,7 @@ async function runPipelineForMember(member, args) {
   if (!dryRun) {
     if (!accessToken) {
       accessToken = await getAccessToken(config, postProfileKey);
-      writeJson(tasksFilePath, config);
+      persistMember(member);
     }
     const parentWithReplies = await withAuthRetry(
       config,
@@ -203,7 +203,7 @@ async function runPipelineForMember(member, args) {
           null
       }
     });
-    writeJson(tasksFilePath, config);
+    persistMember(member);
     return;
   }
 
@@ -224,7 +224,7 @@ async function runPipelineForMember(member, args) {
 
   if (!accessToken) {
     accessToken = await getAccessToken(config, postProfileKey);
-    writeJson(tasksFilePath, config);
+    persistMember(member);
   }
   const replyResult = await withAuthRetry(config, accessToken, (token) =>
     postReply(config, token, threadId, parentMessageId, payload),
@@ -243,7 +243,7 @@ async function runPipelineForMember(member, args) {
     threadId,
     result
   });
-  writeJson(tasksFilePath, config);
+  persistMember(member);
   console.log(`[INFO][${config.id}] Updated member progress for ${progressUpdates.length} task(s).`);
 }
 
@@ -253,16 +253,40 @@ function loadMemberConfigs(memberFilter) {
     throw new Error("members folder was not found.");
   }
 
-  const files = fs
-    .readdirSync(membersDir)
-    .filter((file) => file.endsWith(".json"))
+  const entries = fs.readdirSync(membersDir, { withFileTypes: true });
+  const splitMemberDirs = entries
+    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(membersDir, entry.name, "config.json")))
+    .map((entry) => entry.name)
+    .sort();
+  const splitMemberNames = new Set(splitMemberDirs);
+  const files = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+    .map((entry) => entry.name)
+    .filter((file) => !splitMemberNames.has(path.basename(file, ".json")))
     .sort();
 
-  if (!files.length) {
-    throw new Error("No member config files were found in members/*.json.");
+  if (!splitMemberDirs.length && !files.length) {
+    throw new Error("No member config files were found in members/*/config.json or members/*.json.");
   }
 
   const members = [];
+  for (const dirName of splitMemberDirs) {
+    const memberDir = path.join(membersDir, dirName);
+    const configFilePath = path.join(memberDir, "config.json");
+    const stateFilePath = path.join(memberDir, "state.json");
+    const config = loadSplitMemberConfig(configFilePath, stateFilePath, dirName);
+    if (!shouldLoadMember(config, memberFilter, dirName)) {
+      continue;
+    }
+
+    members.push({
+      filePath: configFilePath,
+      configFilePath,
+      stateFilePath,
+      config
+    });
+  }
+
   for (const file of files) {
     const filePath = path.join(membersDir, file);
     const raw = fs.readFileSync(filePath, "utf8").trim();
@@ -273,12 +297,7 @@ function loadMemberConfigs(memberFilter) {
 
     const config = JSON.parse(raw);
     config.id ||= path.basename(file, ".json");
-    if (memberFilter && config.id !== memberFilter && path.basename(file, ".json") !== memberFilter) {
-      continue;
-    }
-
-    if (config.enabled === false) {
-      console.log(`[INFO][${config.id}] Skipped disabled member.`);
+    if (!shouldLoadMember(config, memberFilter, path.basename(file, ".json"))) {
       continue;
     }
 
@@ -292,16 +311,68 @@ function loadMemberConfigs(memberFilter) {
   return members;
 }
 
+function loadSplitMemberConfig(configFilePath, stateFilePath, fallbackId) {
+  const config = readJson(configFilePath);
+  const state = fs.existsSync(stateFilePath) ? readJson(stateFilePath) : {};
+  config.id ||= fallbackId;
+
+  for (const key of MEMBER_STATE_KEYS) {
+    config[key] = state[key] || config[key] || {};
+  }
+
+  return config;
+}
+
+function shouldLoadMember(config, memberFilter, fallbackId) {
+  if (memberFilter && config.id !== memberFilter && fallbackId !== memberFilter) {
+    return false;
+  }
+
+  if (config.enabled === false) {
+    console.log(`[INFO][${config.id}] Skipped disabled member.`);
+    return false;
+  }
+
+  return true;
+}
+
+function persistMember(member) {
+  if (member.configFilePath && member.stateFilePath) {
+    const { configData, stateData } = splitMemberConfigAndState(member.config);
+    writeJson(member.configFilePath, configData);
+    writeJson(member.stateFilePath, stateData);
+    return;
+  }
+
+  writeJson(member.filePath, member.config);
+}
+
+function splitMemberConfigAndState(config) {
+  const configData = { ...config };
+  const stateData = {};
+
+  for (const key of MEMBER_STATE_KEYS) {
+    stateData[key] = configData[key] || {};
+    delete configData[key];
+  }
+
+  return { configData, stateData };
+}
+
 function acquireMemberRunLock(memberId) {
+  return acquireRunLock(`member-${sanitizeFileName(memberId)}`, { memberId });
+}
+
+function acquireRunLock(lockName, data = {}) {
   const locksDir = path.join(ROOT, ".locks");
   fs.mkdirSync(locksDir, { recursive: true });
 
-  const lockFilePath = path.join(locksDir, `${sanitizeFileName(memberId)}.lock`);
+  const lockFilePath = path.join(locksDir, `${sanitizeFileName(lockName)}.lock`);
   const staleMs = Number(process.env.RUN_LOCK_STALE_MINUTES || 240) * 60 * 1000;
 
   try {
     fs.writeFileSync(lockFilePath, JSON.stringify({
-      memberId,
+      ...data,
       pid: process.pid,
       startedAt: new Date().toISOString()
     }), {
@@ -316,10 +387,10 @@ function acquireMemberRunLock(memberId) {
     const stat = fs.statSync(lockFilePath);
     if (Number.isFinite(staleMs) && staleMs > 0 && Date.now() - stat.mtimeMs > staleMs) {
       fs.unlinkSync(lockFilePath);
-      return acquireMemberRunLock(memberId);
+      return acquireRunLock(lockName, data);
     }
 
-    throw new Error(`Another pipeline run is already active for member ${memberId}.`);
+    throw new Error(`Another pipeline run is already active for lock ${lockName}.`);
   }
 
   return () => {
@@ -327,10 +398,29 @@ function acquireMemberRunLock(memberId) {
       fs.unlinkSync(lockFilePath);
     } catch (error) {
       if (error.code !== "ENOENT") {
-        console.warn(`[WARN][${memberId}] Could not remove run lock: ${error.message}`);
+        console.warn(`[WARN] Could not remove run lock ${lockName}: ${error.message}`);
       }
     }
   };
+}
+
+async function acquireParentPostLock(cacheKey, data = {}) {
+  const timeoutMs = Number(process.env.PARENT_POST_LOCK_TIMEOUT_MS || 120000);
+  const retryMs = Number(process.env.PARENT_POST_LOCK_RETRY_MS || 1000);
+  const deadline = Date.now() + (Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 120000);
+  const safeRetryMs = Number.isFinite(retryMs) && retryMs > 0 ? retryMs : 1000;
+  const lockName = `parent-${cacheKey}`;
+
+  while (true) {
+    try {
+      return acquireRunLock(lockName, data);
+    } catch (error) {
+      if (!String(error.message || "").includes("already active") || Date.now() >= deadline) {
+        throw error;
+      }
+      await sleep(safeRetryMs);
+    }
+  }
 }
 
 function sanitizeFileName(value) {
@@ -438,34 +528,13 @@ function loadDotEnv(filePath) {
   }
 }
 
-function loadJsonEnv(filePath) {
-  if (!fs.existsSync(filePath)) return;
-  const raw = fs.readFileSync(filePath, "utf8").trim();
-  if (!raw) return;
-
-  const json = JSON.parse(raw);
-  const mappings = {
-    username: "AUTH_USERNAME",
-    email: "AUTH_EMAIL",
-    password: "AUTH_PASSWORD",
-    accessToken: "TEAMS_ACCESS_TOKEN",
-    access_token: "TEAMS_ACCESS_TOKEN",
-    refreshToken: "AUTH_REFRESH_TOKEN",
-    refresh_token: "AUTH_REFRESH_TOKEN"
-  };
-
-  for (const [jsonKey, envKey] of Object.entries(mappings)) {
-    if (json[jsonKey] && !process.env[envKey]) {
-      process.env[envKey] = json[jsonKey];
-    }
-  }
-}
 
 function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
 function writeJson(filePath, data) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tempFilePath = `${filePath}.tmp`;
   fs.writeFileSync(tempFilePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
   fs.renameSync(tempFilePath, filePath);
@@ -619,11 +688,11 @@ async function refreshAuthProfilesIfNeeded(config = {}) {
 function hasRefreshTokenSource(config, auth, authKey, cached) {
   return Boolean(
     cached?.refreshToken ||
-      cached?.refresh_token ||
-      auth?.refreshToken ||
-      (auth?.refreshTokenEnv && process.env[auth.refreshTokenEnv]) ||
-      (authKey !== "auth" && auth?.reusePrimaryRefreshToken && getPrimaryRefreshToken(config)) ||
-      process.env.AUTH_REFRESH_TOKEN
+    cached?.refresh_token ||
+    auth?.refreshToken ||
+    (auth?.refreshTokenEnv && process.env[auth.refreshTokenEnv]) ||
+    (authKey !== "auth" && auth?.reusePrimaryRefreshToken && getPrimaryRefreshToken(config)) ||
+    process.env.AUTH_REFRESH_TOKEN
   );
 }
 
@@ -656,11 +725,23 @@ function saveTokenForConfig(config, cacheFile, token, authKey = "auth") {
     writableAuth.token = token;
     if (token.refreshToken) {
       writableAuth.refreshToken = token.refreshToken;
+      syncPrimaryRefreshToken(config, authKey, token.refreshToken);
     }
     return;
   }
 
   writeTokenCache(cacheFile, token);
+}
+
+function syncPrimaryRefreshToken(config, authKey, refreshToken) {
+  const normalizedKey = normalizeAuthKey(authKey);
+  if (normalizedKey !== "spaces" || !refreshToken) {
+    return;
+  }
+
+  config.auth ||= {};
+  config.auth.common ||= {};
+  config.auth.common.refreshToken = refreshToken;
 }
 
 function getTokenCacheFile(config = {}, authKey = "auth") {
@@ -705,8 +786,8 @@ function getWritableAuthProfile(config = {}, authKey = "auth") {
 function isStructuredAuth(authRoot) {
   return Boolean(
     authRoot &&
-      typeof authRoot === "object" &&
-      (authRoot.common || authRoot.spaces || authRoot.substrate || authRoot.ic3)
+    typeof authRoot === "object" &&
+    (authRoot.common || authRoot.spaces || authRoot.substrate || authRoot.ic3)
   );
 }
 
@@ -911,10 +992,10 @@ function normalizeTokenResponse(response, fallbackRefreshToken) {
   const expiresIn = Number(response.expiresIn || response.expires_in || response.data?.expiresIn || 0);
   const refreshTokenExpiresIn = Number(
     response.refreshTokenExpiresIn ||
-      response.refresh_token_expires_in ||
-      response.data?.refreshTokenExpiresIn ||
-      response.data?.refresh_token_expires_in ||
-      0
+    response.refresh_token_expires_in ||
+    response.data?.refreshTokenExpiresIn ||
+    response.data?.refresh_token_expires_in ||
+    0
   );
   const expiresAt =
     response.expiresAt ||
@@ -1155,6 +1236,7 @@ function isExactParentPostResult(result, title) {
 }
 
 async function findOrCreateParentPost(config, accessToken, title, reportDateIso, options = {}) {
+  const parentCacheKey = getParentPostCacheKey(config, title, reportDateIso);
   const cachedParent = config.parentPosts?.[reportDateIso];
   if (cachedParent?.checked && cachedParent.parentMessageId) {
     if (process.env.PARENT_TRUST_CACHED_PARENT !== "true") {
@@ -1183,6 +1265,45 @@ async function findOrCreateParentPost(config, accessToken, title, reportDateIso,
     };
   }
 
+  const globalCachedParent = readGlobalParentPost(parentCacheKey);
+  if (globalCachedParent?.parentMessageId) {
+    const parentPost = {
+      ...globalCachedParent,
+      source: "global-state",
+      createdOrFound: true
+    };
+    markParentPostChecked(config, reportDateIso, parentPost, "global-state");
+    return parentPost;
+  }
+
+  const releaseParentLock = await acquireParentPostLock(parentCacheKey, {
+    memberId: config.id,
+    reportDateIso,
+    threadId: config.teams.threadId,
+    title
+  });
+
+  try {
+    const lockedGlobalCachedParent = readGlobalParentPost(parentCacheKey);
+    if (lockedGlobalCachedParent?.parentMessageId) {
+      const parentPost = {
+        ...lockedGlobalCachedParent,
+        source: "global-state",
+        createdOrFound: true
+      };
+      markParentPostChecked(config, reportDateIso, parentPost, "global-state");
+      return parentPost;
+    }
+
+    const parentPost = await searchOrCreateParentPostUnderLock(config, accessToken, title, reportDateIso, options);
+    writeGlobalParentPost(parentCacheKey, parentPost);
+    return parentPost;
+  } finally {
+    releaseParentLock();
+  }
+}
+
+async function searchOrCreateParentPostUnderLock(config, accessToken, title, reportDateIso, options = {}) {
   try {
     const parentPost = await searchParentPost(config, accessToken, title);
     markParentPostChecked(config, reportDateIso, parentPost, "search");
@@ -1228,6 +1349,39 @@ async function findOrCreateParentPost(config, accessToken, title, reportDateIso,
     source: "created",
     createdOrFound: true
   };
+}
+
+function getParentPostCacheKey(config, title, reportDateIso) {
+  return crypto
+    .createHash("sha256")
+    .update([config.teams.threadId, reportDateIso, title].join("|"))
+    .digest("hex");
+}
+
+function readGlobalParentPost(cacheKey) {
+  const cache = readGlobalParentPostCache();
+  return cache[cacheKey] || null;
+}
+
+function writeGlobalParentPost(cacheKey, parentPost) {
+  const cache = readGlobalParentPostCache();
+  cache[cacheKey] = {
+    title: parentPost.title,
+    parentMessageId: parentPost.parentMessageId,
+    threadId: parentPost.threadId,
+    clientConversationId: parentPost.clientConversationId || null,
+    cachedAt: new Date().toISOString()
+  };
+  writeJson(PARENT_POST_CACHE_FILE, cache);
+}
+
+function readGlobalParentPostCache() {
+  if (!fs.existsSync(PARENT_POST_CACHE_FILE)) return {};
+  try {
+    return readJson(PARENT_POST_CACHE_FILE);
+  } catch {
+    return {};
+  }
 }
 
 async function retryFindCreatedParentMessageId(config, accessToken, title) {
@@ -1773,7 +1927,6 @@ function daysBetween(startDate, endDate) {
 }
 
 function assertPostDayAllowed(config, reportDate) {
-  if (!config.schedule?.skipIfOutOfRange) return;
   if (!isAllowedDay(config, reportDate)) {
     throw new Error(
       `Report date ${formatDate(reportDate)} is outside configured post days (${describeAllowedDays(config)}).`
@@ -1803,8 +1956,8 @@ function ensureReportPostAfterTime(config, reportDate, plan) {
   const baseTime = config.schedule?.postAfterTime || "17:30";
   const windowMinutes = Number(
     config.schedule?.postAfterRandomWindowMinutes ??
-      process.env.REPORT_POST_RANDOM_WINDOW_MINUTES ??
-      0
+    process.env.REPORT_POST_RANDOM_WINDOW_MINUTES ??
+    0
   );
   const safeWindowMinutes = Number.isFinite(windowMinutes) && windowMinutes > 0 ? Math.floor(windowMinutes) : 0;
   const delayMinutes = safeWindowMinutes ? randomIntInclusive(0, safeWindowMinutes) : 0;
@@ -1830,7 +1983,7 @@ function randomIntInclusive(min, max) {
 }
 
 function getPipelineStage(config, reportDate, now, timezone) {
-  if (config.schedule?.skipIfOutOfRange && !isAllowedDay(config, reportDate)) {
+  if (!isAllowedDay(config, reportDate)) {
     console.log(`[INFO][${config.id}] Pipeline skipped. Report date ${formatDate(reportDate)} is outside configured post days (${describeAllowedDays(config)}).`);
     return "skip";
   }
@@ -1918,14 +2071,7 @@ function isAllowedDay(config, dateParts) {
     return allowedDays.has(dateToUtc(dateParts).getUTCDay());
   }
 
-  const from = dayToIndex(config.schedule?.postFromDay ?? "monday");
-  const to = dayToIndex(config.schedule?.postToDay ?? "friday");
-  const day = dateToUtc(dateParts).getUTCDay();
-
-  if (from <= to) {
-    return day >= from && day <= to;
-  }
-  return day >= from || day <= to;
+  return false;
 }
 
 function dayToIndex(day) {
@@ -1949,7 +2095,7 @@ function describeAllowedDays(config) {
     return config.schedule.days.join(", ");
   }
 
-  return `${config.schedule?.postFromDay ?? "monday"} - ${config.schedule?.postToDay ?? "friday"}`;
+  return "no schedule.days configured";
 }
 
 function renderTemplate(template, dateParts, config, extraValues = {}) {
