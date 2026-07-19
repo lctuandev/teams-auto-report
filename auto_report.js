@@ -7,7 +7,8 @@ const ROOT = __dirname;
 const EMPTY_CELL = "&nbsp;";
 const AUTH_KEEPALIVE_PROFILES = ["spaces", "substrate", "ic3"];
 const PARENT_POST_CACHE_FILE = path.join(ROOT, ".state", "parent-posts.json");
-const MEMBER_STATE_KEYS = ["parentPosts", "postedReports", "dailyPlans"];
+const MEMBER_STATE_KEYS = ["parentPosts", "postedReports", "dailyPlans", "monthlyReports"];
+const DEFAULT_REPORT_NUMBER_TEMPLATE = "T{MM}/{REPORT_INDEX}/{MONTH_WORKDAYS}";
 const DAY_INDEX = {
   sunday: 0,
   sun: 0,
@@ -1784,8 +1785,7 @@ function buildReportHtml(config, reportDate) {
   const rows = buildTaskRows(config, reportDate).join("");
   const pendingRows = buildPendingRows(config.pending, "solution", 2).join("");
   const innovationRows = buildPendingRows(config.innovations, "support", 2).join("");
-  const reportNumberTemplate = config.report?.reportNumberTemplate ?? config.report?.numberTemplate ?? "";
-  const reportNumber = renderTemplate(reportNumberTemplate, reportDate, config);
+  const reportNumber = getReportNumber(config, reportDate);
 
   return [
     '<p>&nbsp;</p><figure class="table"><table class="copy-paste-table"><tbody>',
@@ -1820,6 +1820,43 @@ function buildTaskRows(config, reportDate) {
       "</tr>"
     ].join("");
   });
+}
+
+function getReportNumber(config, reportDate) {
+  return getReportNumberInfo(config, reportDate).reportNumber;
+}
+
+function getReportNumberInfo(config, reportDate) {
+  const reportNumberTemplate =
+    config.report?.reportNumberTemplate ??
+    config.report?.numberTemplate ??
+    DEFAULT_REPORT_NUMBER_TEMPLATE;
+  const monthlyReport = getOrCreateMonthlyReport(config, reportDate);
+  const reportDateIso = formatIsoDate(reportDate);
+  const existingPosted = config.postedReports?.[reportDateIso];
+  const existingReportIndex = Number(existingPosted?.reportIndex);
+  const reportIndex = Number.isFinite(existingReportIndex)
+    ? existingReportIndex
+    : getNextReportIndex(config, reportDate, monthlyReport);
+
+  const reportNumber = renderTemplate(reportNumberTemplate || DEFAULT_REPORT_NUMBER_TEMPLATE, reportDate, config, {
+    REPORT_INDEX: String(reportIndex),
+    REPORT_INDEX_PAD2: pad2(reportIndex),
+    REPORTED_WORKDAYS: String(reportIndex),
+    REPORTED_WORKDAYS_PAD2: pad2(reportIndex),
+    MONTH_WORKDAYS: String(monthlyReport.totalWorkdays),
+    MONTH_WORKDAYS_PAD2: pad2(monthlyReport.totalWorkdays),
+    TOTAL_WORKDAYS: String(monthlyReport.totalWorkdays),
+    TOTAL_WORKDAYS_PAD2: pad2(monthlyReport.totalWorkdays)
+  });
+
+  return {
+    monthKey: formatMonthKey(reportDate),
+    reportIndex,
+    reportNumber,
+    totalWorkdays: monthlyReport.totalWorkdays,
+    baseReportedWorkdays: monthlyReport.baseReportedWorkdays || 0
+  };
 }
 
 function updateTaskProgressAfterPost(config, reportDate) {
@@ -1857,7 +1894,7 @@ function buildPendingRows(items = [], secondKey, minRows) {
 }
 
 function calculateTaskPercent(config, task, reportDate, taskIndex = 0) {
-  const startDate = parseDate(task.progressStartDate || config.report?.progressStartDate || formatIsoDate(reportDate));
+  const startDate = parseDate(task.progressStartDate || formatIsoDate(reportDate));
   const progressDates = getProgressDates(startDate, reportDate, config, task, taskIndex);
   const increase = progressDates.reduce((sum, dateParts) => {
     return sum + getTaskIncreaseForDate(config, task, taskIndex, formatIsoDate(dateParts));
@@ -1949,6 +1986,96 @@ function normalizeIncreaseRange(task) {
 
   const fixed = Number(task.dailyIncrease || 0);
   return [fixed, fixed];
+}
+
+function getOrCreateMonthlyReport(config, reportDate) {
+  config.monthlyReports ||= {};
+  const monthKey = formatMonthKey(reportDate);
+  const monthStart = { year: reportDate.year, month: reportDate.month, day: 1 };
+  const monthEnd = getMonthEnd(reportDate.year, reportDate.month);
+  const totalWorkdays = countWorkdays(monthStart, monthEnd, config);
+
+  config.monthlyReports[monthKey] ||= {};
+  const month = config.monthlyReports[monthKey];
+  month.year = reportDate.year;
+  month.month = reportDate.month;
+  month.totalWorkdays = totalWorkdays;
+
+  if (!Number.isFinite(Number(month.baseReportedWorkdays))) {
+    const firstTrackedDateIso = getCheckedReportDatesForMonth(config, monthKey).sort()[0];
+    month.baseReportedWorkdays = getInitialBaseReportedWorkdays(
+      config,
+      firstTrackedDateIso ? parseDate(firstTrackedDateIso) : reportDate
+    );
+  }
+  updateMonthlyReportSummary(config, reportDate);
+
+  return month;
+}
+
+function getNextReportIndex(config, reportDate, monthlyReport) {
+  const monthKey = formatMonthKey(reportDate);
+  const reportDateIso = formatIsoDate(reportDate);
+  const baseReportedWorkdays = Number.isFinite(Number(monthlyReport.baseReportedWorkdays))
+    ? Number(monthlyReport.baseReportedWorkdays)
+    : 0;
+  const checkedBefore = getCheckedReportDatesForMonth(config, monthKey)
+    .filter((dateIso) => dateIso < reportDateIso)
+    .sort();
+  const explicitPriorIndexes = checkedBefore
+    .map((dateIso) => Number(config.postedReports?.[dateIso]?.reportIndex))
+    .filter(Number.isFinite);
+  const nextExplicitIndex = explicitPriorIndexes.length
+    ? Math.max(...explicitPriorIndexes) + 1
+    : baseReportedWorkdays + 1;
+  const nextSequentialIndex = baseReportedWorkdays + checkedBefore.length + 1;
+
+  return Math.max(nextExplicitIndex, nextSequentialIndex);
+}
+
+function updateMonthlyReportSummary(config, reportDate) {
+  const monthKey = formatMonthKey(reportDate);
+  const month = config.monthlyReports?.[monthKey];
+  if (!month) return null;
+
+  const baseReportedWorkdays = Number.isFinite(Number(month.baseReportedWorkdays))
+    ? Number(month.baseReportedWorkdays)
+    : 0;
+  const checkedDates = getCheckedReportDatesForMonth(config, monthKey);
+  month.reportedWorkdays =
+    baseReportedWorkdays +
+    checkedDates.length;
+  month.latestReportDate = checkedDates.length ? checkedDates[checkedDates.length - 1] : null;
+  month.latestReportNumber = month.latestReportDate
+    ? config.postedReports?.[month.latestReportDate]?.reportNumber || null
+    : null;
+  month.updatedAt ||= new Date().toISOString();
+
+  return month;
+}
+
+function getCheckedReportDatesForMonth(config, monthKey) {
+  return Object.entries(config.postedReports || {})
+    .filter(([dateIso, posted]) => dateIso.startsWith(`${monthKey}-`) && posted?.checked)
+    .map(([dateIso]) => dateIso)
+    .sort();
+}
+
+function getInitialBaseReportedWorkdays(config, reportDate) {
+  const monthKey = formatMonthKey(reportDate);
+  const configuredByMonth = config.report?.initialReportedWorkdaysByMonth?.[monthKey];
+  const configured = configuredByMonth ?? config.report?.initialReportedWorkdays;
+  if (Number.isFinite(Number(configured))) {
+    return Math.max(0, Math.floor(Number(configured)));
+  }
+
+  const monthStart = { year: reportDate.year, month: reportDate.month, day: 1 };
+  const previousDate = addDays(reportDate, -1);
+  if (!isSameMonth(formatIsoDate(previousDate), reportDate)) {
+    return 0;
+  }
+
+  return countWorkdays(monthStart, previousDate, config);
 }
 
 function countWorkdays(startDate, endDate, config) {
@@ -2092,16 +2219,26 @@ function isReportAlreadyPosted(config, reportDateIso) {
 }
 
 function markReportChecked(config, { reportDateIso, title, parentMessageId, threadId, result }) {
+  const reportInfo = getReportNumberInfo(config, parseDate(reportDateIso));
+
   config.postedReports ||= {};
   config.postedReports[reportDateIso] = {
     checked: true,
     postedAt: new Date().toISOString(),
+    monthKey: reportInfo.monthKey,
+    reportIndex: reportInfo.reportIndex,
+    reportNumber: reportInfo.reportNumber,
+    totalWorkdays: reportInfo.totalWorkdays,
     title,
     parentMessageId,
     threadId,
     responseOriginalArrivalTime:
       result?.OriginalArrivalTime || result?.originalArrivalTime || result?.originalarrivaltime || null
   };
+  const month = updateMonthlyReportSummary(config, parseDate(reportDateIso));
+  if (month) {
+    month.updatedAt = new Date().toISOString();
+  }
 }
 
 function markParentPostChecked(config, reportDateIso, parentPost, source) {
@@ -2118,12 +2255,25 @@ function markParentPostChecked(config, reportDateIso, parentPost, source) {
 }
 
 function isAllowedDay(config, dateParts) {
+  const dateIso = formatIsoDate(dateParts);
+  if (isDateListed(config.schedule?.skipDates, dateIso) || isDateListed(config.report?.skipDates, dateIso)) {
+    return false;
+  }
+
+  if (isDateListed(config.schedule?.extraWorkDates, dateIso) || isDateListed(config.report?.extraWorkDates, dateIso)) {
+    return true;
+  }
+
   if (Array.isArray(config.schedule?.days) && config.schedule.days.length) {
     const allowedDays = new Set(config.schedule.days.map(dayToIndex));
     return allowedDays.has(dateToUtc(dateParts).getUTCDay());
   }
 
   return false;
+}
+
+function isDateListed(dates, dateIso) {
+  return Array.isArray(dates) && dates.includes(dateIso);
 }
 
 function dayToIndex(day) {
@@ -2237,12 +2387,38 @@ function dateToUtc(dateParts) {
   return new Date(Date.UTC(dateParts.year, dateParts.month - 1, dateParts.day));
 }
 
+function addDays(dateParts, days) {
+  const date = dateToUtc(dateParts);
+  date.setUTCDate(date.getUTCDate() + days);
+  return {
+    year: date.getUTCFullYear(),
+    month: date.getUTCMonth() + 1,
+    day: date.getUTCDate()
+  };
+}
+
+function getMonthEnd(year, month) {
+  return {
+    year,
+    month,
+    day: new Date(Date.UTC(year, month, 0)).getUTCDate()
+  };
+}
+
 function formatDate(dateParts) {
   return `${pad2(dateParts.day)}/${pad2(dateParts.month)}/${dateParts.year}`;
 }
 
 function formatIsoDate(dateParts) {
   return `${dateParts.year}-${pad2(dateParts.month)}-${pad2(dateParts.day)}`;
+}
+
+function formatMonthKey(dateParts) {
+  return `${dateParts.year}-${pad2(dateParts.month)}`;
+}
+
+function isSameMonth(dateIso, dateParts) {
+  return dateIso.startsWith(`${formatMonthKey(dateParts)}-`);
 }
 
 function formatTime(timeParts) {
