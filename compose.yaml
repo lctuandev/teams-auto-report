@@ -11,3 +11,4 @@ services:
       - ./members:/app/members
       - ./.locks:/app/.locks
       - ./.state:/app/.state
+      - ./.browser-profiles:/app/.browser-profiles

@@ -7,11 +7,13 @@ ENV TZ=Asia/Bangkok
 
 RUN apk add --no-cache tzdata
 
-COPY package.json ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+
 COPY auto_report.js readme.md ./
 COPY example ./example
 
-RUN mkdir -p members .locks .state tokens && chown -R node:node /app
+RUN mkdir -p members .locks .state .browser-profiles tokens && chown -R node:node /app
 
 USER node
 

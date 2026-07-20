@@ -2,6 +2,7 @@
 .agents
 .locks
 .state
+.browser-profiles
 .env
 env.json
 token.json

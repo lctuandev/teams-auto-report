@@ -7,6 +7,7 @@ members/*/config.json
 members/*/state.json
 .locks/
 .state/
+.browser-profiles/
 *.tmp
 tmp.json
 node_modules/

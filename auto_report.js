@@ -7,7 +7,7 @@ const ROOT = __dirname;
 const EMPTY_CELL = "&nbsp;";
 const AUTH_KEEPALIVE_PROFILES = ["spaces", "substrate", "ic3"];
 const PARENT_POST_CACHE_FILE = path.join(ROOT, ".state", "parent-posts.json");
-const MEMBER_STATE_KEYS = ["parentPosts", "postedReports", "dailyPlans", "monthlyReports"];
+const MEMBER_STATE_KEYS = ["parentPosts", "postedReports", "dailyPlans", "monthlyReports", "browserRenewals"];
 const DEFAULT_REPORT_NUMBER_TEMPLATE = "T{MM}/{REPORT_INDEX}/{MONTH_WORKDAYS}";
 const DAY_INDEX = {
   sunday: 0,
@@ -73,6 +73,21 @@ async function main() {
     return;
   }
 
+  if (args["renew-token"]) {
+    for (const member of members) {
+      const renewResult = await renewBrowserTokenForMember(member, { force: true });
+      if (renewResult.changed) {
+        persistMember(member);
+      }
+      if (renewResult.renewed) {
+        console.log(`[INFO][${member.config.id}] Browser token renew completed.`);
+      } else {
+        console.log(`[INFO][${member.config.id}] Browser token renew skipped or failed.`);
+      }
+    }
+    return;
+  }
+
   let hasFailure = false;
   for (const member of members) {
     let releaseLock = null;
@@ -109,6 +124,11 @@ async function runPipelineForMember(member, args) {
   let pipelineStage = "report";
 
   if (!force && !dryRun) {
+    const browserRenewResult = await renewBrowserTokenForMember(member);
+    if (browserRenewResult.changed) {
+      persistMember(member);
+    }
+
     const refreshedProfiles = await refreshAuthProfilesIfNeeded(config);
     if (refreshedProfiles.length) {
       persistMember(member);
@@ -162,7 +182,7 @@ async function runPipelineForMember(member, args) {
   }
 
   if (!dryRun && pipelineStage === "parentOnly") {
-    console.log(`[INFO][${config.id}] Parent post is ready for ${reportDateIso}. Report reply will run after ${getReportPostAfterTime(config)}.`);
+    console.log(`[INFO][${config.id}] Parent post is ready for ${reportDateIso}. Report reply will run after ${getReportPostAfterTime(config, reportDate)}.`);
     return;
   }
 
@@ -190,6 +210,7 @@ async function runPipelineForMember(member, args) {
   const existingReply = findExistingReportReply(config, parentPost, reportDate);
   if (!dryRun && existingReply) {
     console.log(`[INFO][${config.id}] Report reply already exists in parent post. Marking ${reportDateIso} as checked.`);
+    const progressUpdates = updateTaskProgressAfterPost(config, reportDate);
     markReportChecked(config, {
       reportDateIso,
       title,
@@ -205,6 +226,7 @@ async function runPipelineForMember(member, args) {
       }
     });
     persistMember(member);
+    console.log(`[INFO][${config.id}] Updated member progress for ${progressUpdates.length} task(s).`);
     return;
   }
 
@@ -478,7 +500,8 @@ function stripWatchOnlyArgs(rawArgs) {
     "date",
     "parent-message-id",
     "thread-id",
-    "test-auth"
+    "test-auth",
+    "renew-token"
   ]);
   const stripped = [];
 
@@ -708,6 +731,18 @@ function getTokenRefreshBeforeMs() {
   const hours = Number(process.env.TOKEN_REFRESH_BEFORE_HOURS || 12);
   const safeHours = Number.isFinite(hours) && hours > 0 ? hours : 12;
   return safeHours * 60 * 60 * 1000;
+}
+
+function getBrowserRenewBeforeMs() {
+  const hours = Number(process.env.BROWSER_RENEW_BEFORE_HOURS || process.env.TOKEN_REFRESH_BEFORE_HOURS || 12);
+  const safeHours = Number.isFinite(hours) && hours > 0 ? hours : 12;
+  return safeHours * 60 * 60 * 1000;
+}
+
+function getBrowserRenewRetryMs() {
+  const minutes = Number(process.env.BROWSER_RENEW_RETRY_MINUTES || 60);
+  const safeMinutes = Number.isFinite(minutes) && minutes > 0 ? minutes : 60;
+  return safeMinutes * 60 * 1000;
 }
 
 function expiresWithin(expiresAt, windowMs) {
@@ -1010,6 +1045,358 @@ function normalizeClaimsValue(claims) {
   return typeof claims === "string" ? claims : JSON.stringify(claims);
 }
 
+async function renewBrowserTokenForMember(member, options = {}) {
+  const config = member.config;
+  if (!isBrowserRenewEnabled(config, options)) {
+    return { changed: false, renewed: false };
+  }
+
+  const reason = getBrowserRenewReason(config, options);
+  if (!reason) {
+    return { changed: false, renewed: false };
+  }
+
+  config.browserRenewals ||= {};
+  const state = config.browserRenewals;
+  const now = Date.now();
+  const lastAttemptAt = state.lastAttemptAt ? new Date(state.lastAttemptAt).getTime() : 0;
+  if (!options.force && lastAttemptAt && now - lastAttemptAt < getBrowserRenewRetryMs()) {
+    console.log(
+      `[INFO][${config.id}] Browser token renew skipped. Last attempt was ${formatMsRemaining(now - lastAttemptAt)} ago.`
+    );
+    return { changed: false, renewed: false };
+  }
+
+  state.lastAttemptAt = new Date().toISOString();
+  state.lastReason = reason;
+
+  let releaseLock = null;
+  try {
+    releaseLock = acquireRunLock(`browser-renew-${sanitizeFileName(config.id)}`, { memberId: config.id, reason });
+    const token = await renewRefreshTokenWithBrowser(config, { reason });
+    saveBrowserRefreshToken(config, token);
+    state.lastSuccessAt = new Date().toISOString();
+    state.lastRefreshTokenExpiresAt = token.refreshTokenExpiresAt || null;
+    state.lastError = null;
+    console.log(`[INFO][${config.id}] Browser renew saved refresh token. refreshTokenExpiresAt=${formatExpiryForLog(token.refreshTokenExpiresAt)}`);
+    return { changed: true, renewed: true };
+  } catch (error) {
+    state.lastError = error.message;
+    console.warn(`[WARN][${config.id}] Browser token renew failed: ${error.message}`);
+    return { changed: true, renewed: false };
+  } finally {
+    if (releaseLock) {
+      releaseLock();
+    }
+  }
+}
+
+function isBrowserRenewEnabled(config = {}, options = {}) {
+  if (options.force) return true;
+  if (config.browser?.autoRenew === false) return false;
+  return process.env.AUTO_BROWSER_RENEW !== "false";
+}
+
+function getBrowserRenewReason(config = {}, options = {}) {
+  if (options.force) return "forced";
+  if (!getPrimaryRefreshToken(config)) return "missing-common-refresh-token";
+
+  const expiringProfiles = AUTH_KEEPALIVE_PROFILES.filter((authKey) => {
+    const auth = config.auth?.[authKey];
+    if (!auth) return false;
+    const expiresAt =
+      auth.token?.refreshTokenExpiresAt ||
+      auth.token?.refresh_token_expires_at ||
+      null;
+    return expiresWithin(expiresAt, getBrowserRenewBeforeMs());
+  });
+
+  return expiringProfiles.length ? `expiring-refresh-token:${expiringProfiles.join(",")}` : "";
+}
+
+async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
+  const playwright = loadPlaywright();
+  const browserTypeName = config.browser?.type || process.env.BROWSER_RENEW_TYPE || "chromium";
+  const browserType = playwright[browserTypeName];
+  if (!browserType?.launchPersistentContext) {
+    throw new Error(`Playwright browser type "${browserTypeName}" is not available.`);
+  }
+
+  const profileDir = getBrowserProfileDir(config);
+  const headless = parseBoolean(config.browser?.headless ?? process.env.BROWSER_RENEW_HEADLESS, false);
+  const channel = config.browser?.channel || process.env.BROWSER_RENEW_CHANNEL || "chrome";
+  const timeoutMs = Number(config.browser?.timeoutMs || process.env.BROWSER_RENEW_TIMEOUT_MS || 600000);
+  const safeTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 600000;
+  const auth = getAuthProfile(config, "common");
+  const authUrl = buildBrowserAuthorizeUrl(config, auth);
+
+  fs.mkdirSync(profileDir, { recursive: true });
+  console.log(
+    `[INFO][${config.id}] Browser token renew started (${options.reason || "renew"}). Profile: ${path.relative(ROOT, profileDir) || profileDir}`
+  );
+
+  const launchOptions = {
+    headless,
+    viewport: { width: 1280, height: 900 },
+    ignoreHTTPSErrors: true
+  };
+  if (channel) {
+    launchOptions.channel = channel;
+  }
+  if (config.browser?.executablePath || process.env.BROWSER_RENEW_EXECUTABLE_PATH) {
+    launchOptions.executablePath = config.browser?.executablePath || process.env.BROWSER_RENEW_EXECUTABLE_PATH;
+    delete launchOptions.channel;
+  }
+
+  const context = await browserType.launchPersistentContext(profileDir, launchOptions);
+  const page = context.pages()[0] || await context.newPage();
+
+  try {
+    let codeError = null;
+    let networkError = null;
+    const tokenFromNetworkPromise = waitForBrowserTokenResponse(page, config, safeTimeoutMs)
+      .catch((error) => {
+        networkError = error;
+        return null;
+      });
+    await page.goto(authUrl, { waitUntil: "domcontentloaded", timeout: safeTimeoutMs });
+
+    const tokenFromCodePromise = waitForAuthCodeUrl(page, safeTimeoutMs)
+      .then((code) => exchangeAuthorizationCodeForToken(code, config))
+      .catch((error) => {
+        codeError = error;
+        return null;
+      });
+
+    let token = await Promise.race([tokenFromCodePromise, tokenFromNetworkPromise]);
+    if (!token) {
+      const tokens = await Promise.all([tokenFromCodePromise, tokenFromNetworkPromise]);
+      token = tokens.find(Boolean);
+    }
+
+    if (!token?.refreshToken) {
+      const details = [codeError?.message, networkError?.message].filter(Boolean).join("; ");
+      throw new Error(`Browser renew did not capture a refresh token.${details ? ` ${details}` : ""}`);
+    }
+
+    return token;
+  } finally {
+    if (config.browserRenewals) {
+      delete config.browserRenewals.currentCodeVerifier;
+    }
+    await context.close();
+  }
+}
+
+function loadPlaywright() {
+  try {
+    return require("playwright-core");
+  } catch (coreError) {
+    try {
+      return require("playwright");
+    } catch {
+      throw new Error(
+        `Playwright is not installed. Run "npm install" first. Original error: ${coreError.message}`
+      );
+    }
+  }
+}
+
+function getBrowserProfileDir(config = {}) {
+  const rawDir =
+    config.browser?.profileDir ||
+    process.env.BROWSER_PROFILE_DIR ||
+    path.join(".browser-profiles", sanitizeFileName(config.id || "member"));
+  return path.resolve(ROOT, rawDir);
+}
+
+function buildBrowserAuthorizeUrl(config = {}, auth = {}) {
+  const tenant = getTenantFromAuthRefreshUrl() || "common";
+  const url = new URL(`https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`);
+  const pkce = createPkcePair();
+  config.browserRenewals ||= {};
+  config.browserRenewals.currentCodeVerifier = pkce.verifier;
+
+  url.searchParams.set("client_id", auth.clientId || process.env.MS_CLIENT_ID || "5e3ce6c0-2b1f-4285-8d4b-75ee78787346");
+  url.searchParams.set("scope", config.browser?.scope || process.env.BROWSER_RENEW_SCOPE || "openid profile openid offline_access");
+  url.searchParams.set("redirect_uri", auth.redirectUri || process.env.MS_REDIRECT_URI || "https://teams.cloud.microsoft/v2/authv2");
+  url.searchParams.set("client-request-id", crypto.randomUUID());
+  url.searchParams.set("response_mode", "fragment");
+  url.searchParams.set("client_info", process.env.MS_CLIENT_INFO || "1");
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("code_challenge", pkce.challenge);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("nonce", crypto.randomUUID());
+  url.searchParams.set("state", crypto.randomUUID());
+  if (config.browser?.prompt || process.env.BROWSER_RENEW_PROMPT) {
+    url.searchParams.set("prompt", config.browser?.prompt || process.env.BROWSER_RENEW_PROMPT);
+  }
+
+  return url.toString();
+}
+
+function getTenantFromAuthRefreshUrl() {
+  try {
+    const url = new URL(process.env.AUTH_REFRESH_URL);
+    const parts = url.pathname.split("/").filter(Boolean);
+    return parts[0] || "";
+  } catch {
+    return "";
+  }
+}
+
+function createPkcePair() {
+  const verifier = base64Url(crypto.randomBytes(32));
+  const challenge = base64Url(crypto.createHash("sha256").update(verifier).digest());
+  return { verifier, challenge };
+}
+
+function base64Url(buffer) {
+  return Buffer.from(buffer)
+    .toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/g, "");
+}
+
+async function waitForAuthCodeUrl(page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const code = extractAuthCodeFromUrl(page.url());
+    if (code) return code;
+    await sleep(500);
+  }
+
+  throw new Error("Timeout waiting for browser authorization code.");
+}
+
+function extractAuthCodeFromUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const hashParams = new URLSearchParams(url.hash.replace(/^#/, ""));
+    return url.searchParams.get("code") || hashParams.get("code") || "";
+  } catch {
+    return "";
+  }
+}
+
+async function waitForBrowserTokenResponse(page, config, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("Timeout waiting for Teams browser token response."));
+    }, timeoutMs);
+
+    page.on("response", async (response) => {
+      try {
+        if (!isMicrosoftTokenUrl(response.url()) || response.request().method() !== "POST") {
+          return;
+        }
+
+        const requestBody = response.request().postData() || "";
+        const requestParams = new URLSearchParams(requestBody);
+        const tokenResponse = await response.json().catch(() => null);
+        if (!tokenResponse?.refresh_token && !tokenResponse?.refreshToken) {
+          return;
+        }
+
+        if (!isPreferredBrowserTokenRequest(config, response.url(), requestParams, tokenResponse)) {
+          return;
+        }
+
+        clearTimeout(timer);
+        resolve(normalizeTokenResponse(tokenResponse));
+      } catch (error) {
+        clearTimeout(timer);
+        reject(error);
+      }
+    });
+  });
+}
+
+function isMicrosoftTokenUrl(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    return url.hostname === "login.microsoftonline.com" && url.pathname.includes("/oauth2/v2.0/token");
+  } catch {
+    return false;
+  }
+}
+
+function isPreferredBrowserTokenRequest(config, rawUrl, requestParams, tokenResponse) {
+  const expectedClientId = getAuthProfile(config, "common").clientId || process.env.MS_CLIENT_ID;
+  const url = new URL(rawUrl);
+  const clientId = requestParams.get("client_id") || url.searchParams.get("client_id") || "";
+  if (expectedClientId && clientId && clientId !== expectedClientId) {
+    return false;
+  }
+
+  const grantType = requestParams.get("grant_type") || "";
+  if (grantType && grantType !== "authorization_code") {
+    return false;
+  }
+
+  const scope = tokenResponse.scope || requestParams.get("scope") || "";
+  return !scope || scope.includes("offline_access") || scope.includes("openid");
+}
+
+async function exchangeAuthorizationCodeForToken(code, config = {}) {
+  const auth = getAuthProfile(config, "common");
+  const verifier = config.browserRenewals?.currentCodeVerifier;
+  if (!verifier) {
+    throw new Error("Missing PKCE code verifier for browser renew.");
+  }
+
+  const params = new URLSearchParams();
+  setFormValue(params, "client_id", auth.clientId || process.env.MS_CLIENT_ID);
+  setFormValue(params, "redirect_uri", auth.redirectUri || process.env.MS_REDIRECT_URI);
+  setFormValue(params, "scope", config.browser?.scope || process.env.BROWSER_RENEW_SCOPE || "openid profile openid offline_access");
+  setFormValue(params, "grant_type", "authorization_code");
+  setFormValue(params, "client_info", process.env.MS_CLIENT_INFO || "1");
+  setFormValue(params, "code", code);
+  setFormValue(params, "code_verifier", verifier);
+  setFormValue(params, "x-client-SKU", process.env.MS_X_CLIENT_SKU);
+  setFormValue(params, "x-client-VER", process.env.MS_X_CLIENT_VER);
+  setFormValue(params, "x-ms-lib-capability", process.env.MS_X_MS_LIB_CAPABILITY);
+  setFormValue(params, "x-client-current-telemetry", process.env.MS_X_CLIENT_CURRENT_TELEMETRY);
+  setFormValue(params, "x-client-last-telemetry", process.env.MS_X_CLIENT_LAST_TELEMETRY);
+
+  const response = await fetchJson(buildRefreshTokenUrl(process.env.AUTH_REFRESH_URL, config, "common"), {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded;charset=utf-8",
+      ...buildSpaAuthHeaders(config, "common")
+    },
+    body: params.toString()
+  });
+
+  const token = normalizeTokenResponse(response);
+  logTokenExpiry(config, "common", token);
+  return token;
+}
+
+function saveBrowserRefreshToken(config, token) {
+  if (!token?.refreshToken) {
+    throw new Error("Browser token response does not contain refreshToken.");
+  }
+
+  config.auth ||= {};
+  config.auth.common ||= {};
+  config.auth.common.refreshToken = token.refreshToken;
+
+  for (const authKey of AUTH_KEEPALIVE_PROFILES) {
+    if (!config.auth[authKey]) continue;
+    if (config.auth[authKey].reusePrimaryRefreshToken === false) continue;
+
+    config.auth[authKey].refreshToken = token.refreshToken;
+    config.auth[authKey].token ||= {};
+    config.auth[authKey].token.refreshToken = token.refreshToken;
+    if (token.refreshTokenExpiresAt) {
+      config.auth[authKey].token.refreshTokenExpiresAt = token.refreshTokenExpiresAt;
+    }
+  }
+}
+
 async function login(config = {}, authKey = "auth") {
   const auth = getAuthProfile(config, authKey);
   if (!process.env.AUTH_LOGIN_URL) {
@@ -1291,7 +1678,7 @@ function isExactParentPostResult(result, title) {
 async function findOrCreateParentPost(config, accessToken, title, reportDateIso, options = {}) {
   const parentCacheKey = getParentPostCacheKey(config, title, reportDateIso);
   const cachedParent = config.parentPosts?.[reportDateIso];
-  if (cachedParent?.checked && cachedParent.parentMessageId) {
+  if (cachedParent?.checked && cachedParent.parentMessageId && isCachedParentPostMatch(config, cachedParent, title)) {
     if (process.env.PARENT_TRUST_CACHED_PARENT !== "true") {
       try {
         const parentPost = await searchParentPost(config, accessToken, title);
@@ -1354,6 +1741,11 @@ async function findOrCreateParentPost(config, accessToken, title, reportDateIso,
   } finally {
     releaseParentLock();
   }
+}
+
+function isCachedParentPostMatch(config, cachedParent, title) {
+  const cachedThreadId = cachedParent.threadId || config.teams.threadId;
+  return cachedParent.title === title && cachedThreadId === config.teams.threadId;
 }
 
 async function searchOrCreateParentPostUnderLock(config, accessToken, title, reportDateIso, options = {}) {
@@ -2274,6 +2666,16 @@ function isAllowedDay(config, dateParts) {
 
 function isDateListed(dates, dateIso) {
   return Array.isArray(dates) && dates.includes(dateIso);
+}
+
+function parseBoolean(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (value === undefined || value === null || value === "") return fallback;
+
+  const normalized = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "n", "off"].includes(normalized)) return false;
+  return fallback;
 }
 
 function dayToIndex(day) {

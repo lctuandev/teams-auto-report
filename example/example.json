@@ -62,6 +62,13 @@
     "fromUserId": "8:orgid:<user-oid>",
     "displayName": "Your Display Name"
   },
+  "browser": {
+    "autoRenew": true,
+    "profileDir": ".browser-profiles/your_member_id",
+    "channel": "chrome",
+    "headless": false,
+    "timeoutMs": 600000
+  },
   "schedule": {
     "timezone": "Asia/Bangkok",
     "days": [

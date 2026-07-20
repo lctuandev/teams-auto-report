@@ -13,6 +13,7 @@
     "watch": "node auto_report.js --watch",
     "check": "node --check auto_report.js",
     "dry-run": "node auto_report.js --dry-run",
+    "renew-token": "node auto_report.js --renew-token",
     "test-auth:spaces": "node auto_report.js --test-auth spaces",
     "test-auth:substrate": "node auto_report.js --test-auth substrate",
     "test-auth:ic3": "node auto_report.js --test-auth ic3"
@@ -22,5 +23,8 @@
     "automation",
     "report"
   ],
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "dependencies": {
+    "playwright-core": "^1.61.1"
+  }
 }
