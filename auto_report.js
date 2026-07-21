@@ -1899,6 +1899,19 @@ function isExactParentPostResult(result, title) {
 
 async function findOrCreateParentPost(config, accessToken, title, reportDateIso, options = {}) {
   const parentCacheKey = getParentPostCacheKey(config, title, reportDateIso);
+  // The global cache is authoritative across members. Check it before a
+  // member-local cache so one member cannot switch back to a duplicate parent.
+  const globalCachedParent = readGlobalParentPost(parentCacheKey);
+  if (globalCachedParent?.parentMessageId) {
+    const parentPost = {
+      ...globalCachedParent,
+      source: "global-state",
+      createdOrFound: true
+    };
+    markParentPostChecked(config, reportDateIso, parentPost, "global-state");
+    return parentPost;
+  }
+
   const cachedParent = config.parentPosts?.[reportDateIso];
   if (cachedParent?.checked && cachedParent.parentMessageId && isCachedParentPostMatch(config, cachedParent, title)) {
     if (process.env.PARENT_TRUST_CACHED_PARENT !== "true") {
@@ -1925,17 +1938,6 @@ async function findOrCreateParentPost(config, accessToken, title, reportDateIso,
       rank: null,
       source: "state"
     };
-  }
-
-  const globalCachedParent = readGlobalParentPost(parentCacheKey);
-  if (globalCachedParent?.parentMessageId) {
-    const parentPost = {
-      ...globalCachedParent,
-      source: "global-state",
-      createdOrFound: true
-    };
-    markParentPostChecked(config, reportDateIso, parentPost, "global-state");
-    return parentPost;
   }
 
   const releaseParentLock = await acquireParentPostLock(parentCacheKey, {
@@ -2021,8 +2023,19 @@ async function searchOrCreateParentPostUnderLock(config, accessToken, title, rep
 function getParentPostCacheKey(config, title, reportDateIso) {
   return crypto
     .createHash("sha256")
-    .update([config.teams.threadId, reportDateIso, title].join("|"))
+    .update([config.teams.threadId, reportDateIso, normalizeParentTitleForCache(title)].join("|"))
     .digest("hex");
+}
+
+function normalizeParentTitleForCache(title) {
+  return String(title || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/Đ/g, "D")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 function readGlobalParentPost(cacheKey) {

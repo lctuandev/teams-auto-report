@@ -54,8 +54,8 @@
     "threadId": "19:<channel-thread-id>@thread.tacv2",
     "teamId": "19:<team-id>@thread.tacv2",
     "conversationLinkPrefix": "https://teams.cloud.microsoft/l/message",
-    "searchTitleTemplate": "ADVANCE UAV NAVIGATION SYSTEM - Bao cao ngay {DD}/{MM}/{YYYY}",
-    "parentPostContentTemplate": "<p>ADVANCE UAV NAVIGATION SYSTEM - Bao cao ngay {DD}/{MM}/{YYYY}</p>"
+    "searchTitleTemplate": "ADVANCE UAV NAVIGATION SYSTEM - Báo cáo ngày {DD}/{MM}/{YYYY}",
+    "parentPostContentTemplate": "<p>ADVANCE UAV NAVIGATION SYSTEM - Báo cáo ngày {DD}/{MM}/{YYYY}</p>"
   },
   "author": {
     "from": "8:orgid:<user-oid>",
