@@ -81,6 +81,25 @@ async function main() {
       }
       if (renewResult.renewed) {
         console.log(`[INFO][${member.config.id}] Browser token renew completed.`);
+        let profileFailure = false;
+        for (const authKey of AUTH_KEEPALIVE_PROFILES) {
+          if (!member.config.auth?.[authKey]) continue;
+          try {
+            const accessToken = await getAccessToken(member.config, authKey);
+            console.log(
+              `[INFO][${member.config.id}][${authKey}] Access token generated and saved (length: ${accessToken.length}).`
+            );
+          } catch (error) {
+            profileFailure = true;
+            console.error(
+              `[ERROR][${member.config.id}][${authKey}] Could not generate access token: ${error.message}`
+            );
+          }
+        }
+        persistMember(member);
+        if (profileFailure) {
+          process.exitCode = 1;
+        }
       } else {
         console.log(`[INFO][${member.config.id}] Browser token renew skipped or failed.`);
       }
@@ -845,7 +864,18 @@ function normalizeAuthKey(authKey = "auth") {
 }
 
 function getPrimaryRefreshToken(config = {}) {
-  return config.auth?.common?.refreshToken || config.auth?.spaces?.refreshToken || null;
+  const candidates = [config.auth?.common?.refreshToken, config.auth?.spaces?.refreshToken];
+  return candidates.find(isUsableCredential) || null;
+}
+
+function isUsableCredential(value) {
+  if (!value) return false;
+  const normalized = String(value).trim();
+  if (!normalized) return false;
+  return !(
+    /^(PASTE|REPLACE|YOUR_|TODO)/i.test(normalized) ||
+    /(<[^>]+>|_HERE$)/i.test(normalized)
+  );
 }
 
 function getDefaultAnchorMailbox(config = {}) {
@@ -1127,8 +1157,10 @@ async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
   const channel = config.browser?.channel || process.env.BROWSER_RENEW_CHANNEL || "chrome";
   const timeoutMs = Number(config.browser?.timeoutMs || process.env.BROWSER_RENEW_TIMEOUT_MS || 600000);
   const safeTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 600000;
-  const auth = getAuthProfile(config, "common");
-  const authUrl = buildBrowserAuthorizeUrl(config, auth);
+  const startUrl =
+    config.browser?.startUrl ||
+    process.env.BROWSER_RENEW_START_URL ||
+    "https://teams.cloud.microsoft/";
 
   fs.mkdirSync(profileDir, { recursive: true });
   console.log(
@@ -1149,7 +1181,9 @@ async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
   }
 
   const context = await browserType.launchPersistentContext(profileDir, launchOptions);
-  const page = context.pages()[0] || await context.newPage();
+  // A persistent profile can reopen the previous blank OAuth callback tab.
+  // Always use a fresh page so the authorization navigation starts cleanly.
+  const page = await context.newPage();
 
   try {
     let codeError = null;
@@ -1159,9 +1193,16 @@ async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
         networkError = error;
         return null;
       });
-    await page.goto(authUrl, { waitUntil: "domcontentloaded", timeout: safeTimeoutMs });
+    // Register before goto(): the callback page can remove code/error from its
+    // address before page.goto() resolves.
+    const codeFromNavigationPromise = waitForAuthCodeNavigation(page, safeTimeoutMs);
+    console.log(`[INFO][${config.id}] Opening browser renew start URL: ${startUrl}`);
+    await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: safeTimeoutMs });
 
-    const tokenFromCodePromise = waitForAuthCodeUrl(page, safeTimeoutMs)
+    const tokenFromCodePromise = Promise.race([
+      codeFromNavigationPromise,
+      waitForAuthCodeUrl(page, safeTimeoutMs)
+    ])
       .then((code) => exchangeAuthorizationCodeForToken(code, config))
       .catch((error) => {
         codeError = error;
@@ -1221,7 +1262,9 @@ function buildBrowserAuthorizeUrl(config = {}, auth = {}) {
   url.searchParams.set("scope", config.browser?.scope || process.env.BROWSER_RENEW_SCOPE || "openid profile openid offline_access");
   url.searchParams.set("redirect_uri", auth.redirectUri || process.env.MS_REDIRECT_URI || "https://teams.cloud.microsoft/v2/authv2");
   url.searchParams.set("client-request-id", crypto.randomUUID());
-  url.searchParams.set("response_mode", "fragment");
+  // Query mode keeps the authorization code visible to Playwright even when
+  // the Teams callback page itself is blank or clears its URL fragment.
+  url.searchParams.set("response_mode", "query");
   url.searchParams.set("client_info", process.env.MS_CLIENT_INFO || "1");
   url.searchParams.set("response_type", "code");
   url.searchParams.set("code_challenge", pkce.challenge);
@@ -1261,23 +1304,91 @@ function base64Url(buffer) {
 
 async function waitForAuthCodeUrl(page, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  let lastUrl = "";
 
   while (Date.now() < deadline) {
-    const code = extractAuthCodeFromUrl(page.url());
-    if (code) return code;
+    const currentUrl = page.url();
+    if (currentUrl !== lastUrl) {
+      lastUrl = currentUrl;
+      console.log(`[INFO] Browser navigated to: ${sanitizeAuthUrlForLog(currentUrl)}`);
+    }
+
+    const callback = extractAuthCallbackFromUrl(currentUrl);
+    if (callback.code) return callback.code;
+    if (callback.error) {
+      throw new Error(
+        `Microsoft OAuth returned ${callback.error}${callback.errorDescription ? `: ${callback.errorDescription}` : ""}`
+      );
+    }
     await sleep(500);
   }
 
-  throw new Error("Timeout waiting for browser authorization code.");
+  throw new Error(`Timeout waiting for browser authorization code. Last URL: ${sanitizeAuthUrlForLog(lastUrl)}`);
 }
 
 function extractAuthCodeFromUrl(rawUrl) {
+  return extractAuthCallbackFromUrl(rawUrl).code;
+}
+
+function waitForAuthCodeNavigation(page, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      page.off("request", onRequest);
+    };
+    const onRequest = (request) => {
+      const callback = extractAuthCallbackFromUrl(request.url());
+      if (callback.code) {
+        cleanup();
+        resolve(callback.code);
+      } else if (callback.error) {
+        cleanup();
+        reject(
+          new Error(
+            `Microsoft OAuth returned ${callback.error}${callback.errorDescription ? `: ${callback.errorDescription}` : ""}`
+          )
+        );
+      }
+    };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error("Timeout waiting for OAuth callback navigation."));
+    }, timeoutMs);
+
+    page.on("request", onRequest);
+  });
+}
+
+function extractAuthCallbackFromUrl(rawUrl) {
   try {
     const url = new URL(rawUrl);
     const hashParams = new URLSearchParams(url.hash.replace(/^#/, ""));
-    return url.searchParams.get("code") || hashParams.get("code") || "";
+    return {
+      code: url.searchParams.get("code") || hashParams.get("code") || "",
+      error: url.searchParams.get("error") || hashParams.get("error") || "",
+      errorDescription:
+        url.searchParams.get("error_description") || hashParams.get("error_description") || ""
+    };
   } catch {
-    return "";
+    return { code: "", error: "", errorDescription: "" };
+  }
+}
+
+function sanitizeAuthUrlForLog(rawUrl) {
+  try {
+    const url = new URL(rawUrl);
+    const sensitiveKeys = ["code", "access_token", "id_token", "client_info", "session_state"];
+    for (const key of sensitiveKeys) {
+      if (url.searchParams.has(key)) url.searchParams.set(key, "[redacted]");
+    }
+    const hashParams = new URLSearchParams(url.hash.replace(/^#/, ""));
+    for (const key of sensitiveKeys) {
+      if (hashParams.has(key)) hashParams.set(key, "[redacted]");
+    }
+    url.hash = hashParams.toString() ? `#${hashParams}` : "";
+    return url.toString();
+  } catch {
+    return String(rawUrl || "");
   }
 }
 
@@ -1294,7 +1405,8 @@ async function waitForBrowserTokenResponse(page, config, timeoutMs) {
         }
 
         const requestBody = response.request().postData() || "";
-        const requestParams = new URLSearchParams(requestBody);
+        const requestParams = mergeOAuthRequestParams(response.url(), requestBody);
+        const requestHeaders = await response.request().allHeaders().catch(() => ({}));
         const tokenResponse = await response.json().catch(() => null);
         if (!tokenResponse?.refresh_token && !tokenResponse?.refreshToken) {
           return;
@@ -1305,7 +1417,14 @@ async function waitForBrowserTokenResponse(page, config, timeoutMs) {
         }
 
         clearTimeout(timer);
-        resolve(normalizeTokenResponse(tokenResponse));
+        const token = normalizeTokenResponse(tokenResponse);
+        token.browserMetadata = extractBrowserAuthMetadata(
+          token,
+          requestParams,
+          response.url(),
+          requestHeaders
+        );
+        resolve(token);
       } catch (error) {
         clearTimeout(timer);
         reject(error);
@@ -1324,20 +1443,19 @@ function isMicrosoftTokenUrl(rawUrl) {
 }
 
 function isPreferredBrowserTokenRequest(config, rawUrl, requestParams, tokenResponse) {
-  const expectedClientId = getAuthProfile(config, "common").clientId || process.env.MS_CLIENT_ID;
-  const url = new URL(rawUrl);
-  const clientId = requestParams.get("client_id") || url.searchParams.get("client_id") || "";
-  if (expectedClientId && clientId && clientId !== expectedClientId) {
-    return false;
-  }
-
   const grantType = requestParams.get("grant_type") || "";
-  if (grantType && grantType !== "authorization_code") {
+  if (grantType && !["authorization_code", "refresh_token"].includes(grantType)) {
     return false;
   }
 
   const scope = tokenResponse.scope || requestParams.get("scope") || "";
-  return !scope || scope.includes("offline_access") || scope.includes("openid");
+  const clientId = requestParams.get("client_id") || "";
+  const refreshToken = tokenResponse.refresh_token || tokenResponse.refreshToken || "";
+  return Boolean(
+    clientId &&
+    refreshToken &&
+    (!scope || scope.includes("offline_access") || scope.includes("openid"))
+  );
 }
 
 async function exchangeAuthorizationCodeForToken(code, config = {}) {
@@ -1371,8 +1489,78 @@ async function exchangeAuthorizationCodeForToken(code, config = {}) {
   });
 
   const token = normalizeTokenResponse(response);
+  token.browserMetadata = extractBrowserAuthMetadata(
+    token,
+    params,
+    process.env.AUTH_REFRESH_URL
+  );
   logTokenExpiry(config, "common", token);
   return token;
+}
+
+function mergeOAuthRequestParams(rawUrl, requestBody = "") {
+  const params = new URLSearchParams();
+  try {
+    for (const [key, value] of new URL(rawUrl).searchParams) params.set(key, value);
+  } catch {
+    // The POST body below is still usable when the URL is invalid.
+  }
+  for (const [key, value] of new URLSearchParams(requestBody)) params.set(key, value);
+  return params;
+}
+
+function getOAuthParam(params, ...keys) {
+  for (const key of keys) {
+    const value = params.get(key);
+    if (value) return value;
+  }
+  return "";
+}
+
+function extractBrowserAuthMetadata(
+  token,
+  requestParams = new URLSearchParams(),
+  tokenUrl = "",
+  requestHeaders = {}
+) {
+  const idClaims = decodeJwtPayload(token?.idToken) || {};
+  const accessClaims = decodeJwtPayload(token?.accessToken) || {};
+  const claims = { ...accessClaims, ...idClaims };
+  let tenantId = claims.tid || "";
+
+  if (!tenantId) {
+    try {
+      tenantId = new URL(tokenUrl).pathname.split("/").filter(Boolean)[0] || "";
+    } catch {
+      tenantId = "";
+    }
+  }
+
+  const requestClientId =
+    getOAuthParam(requestParams, "client_id") ||
+    claims.appid ||
+    claims.azp ||
+    claims.aud ||
+    "";
+  const redirectUri = getOAuthParam(requestParams, "redirect_uri");
+  const brkClientId = getOAuthParam(requestParams, "brk_client_id");
+  const brkRedirectUri = getOAuthParam(requestParams, "brk_redirect_uri");
+  const requestAnchorMailbox =
+    getOAuthParam(requestParams, "X-AnchorMailbox", "x-anchormailbox") ||
+    requestHeaders["x-anchormailbox"] ||
+    "";
+
+  return {
+    clientId: brkClientId || requestClientId,
+    brkClientId: brkClientId || requestClientId,
+    redirectUri,
+    brkRedirectUri,
+    anchorMailbox: requestAnchorMailbox,
+    hasBrkFields: Boolean(brkClientId || brkRedirectUri),
+    oid: claims.oid || "",
+    tenantId,
+    displayName: claims.name || ""
+  };
 }
 
 function saveBrowserRefreshToken(config, token) {
@@ -1383,6 +1571,7 @@ function saveBrowserRefreshToken(config, token) {
   config.auth ||= {};
   config.auth.common ||= {};
   config.auth.common.refreshToken = token.refreshToken;
+  applyBrowserAuthMetadata(config, token.browserMetadata);
 
   for (const authKey of AUTH_KEEPALIVE_PROFILES) {
     if (!config.auth[authKey]) continue;
@@ -1394,6 +1583,39 @@ function saveBrowserRefreshToken(config, token) {
     if (token.refreshTokenExpiresAt) {
       config.auth[authKey].token.refreshTokenExpiresAt = token.refreshTokenExpiresAt;
     }
+  }
+}
+
+function applyBrowserAuthMetadata(config, metadata = {}) {
+  const common = config.auth.common;
+  if (metadata.clientId) common.clientId = metadata.clientId;
+  if (metadata.brkClientId) common.brkClientId = metadata.brkClientId;
+  if (metadata.redirectUri) common.redirectUri = metadata.redirectUri;
+  if (metadata.brkRedirectUri) common.brkRedirectUri = metadata.brkRedirectUri;
+  if (metadata.anchorMailbox) {
+    common.anchorMailbox = metadata.anchorMailbox;
+  } else if (metadata.oid && metadata.tenantId) {
+    common.anchorMailbox = `Oid:${metadata.oid}@${metadata.tenantId}`;
+  }
+  if (metadata.hasBrkFields) common.includeBrkFields = true;
+
+  if (metadata.oid) {
+    const authorId = `8:orgid:${metadata.oid}`;
+    config.author ||= {};
+    config.author.from = authorId;
+    config.author.fromUserId = authorId;
+    if (metadata.displayName) config.author.displayName = metadata.displayName;
+  }
+
+  const updatedFields = [
+    metadata.clientId && "clientId",
+    metadata.brkClientId && "brkClientId",
+    metadata.redirectUri && "redirectUri",
+    metadata.oid && metadata.tenantId && "anchorMailbox",
+    metadata.oid && "author"
+  ].filter(Boolean);
+  if (updatedFields.length) {
+    console.log(`[INFO][${config.id || "member"}] Auto-detected config: ${updatedFields.join(", ")}.`);
   }
 }
 
@@ -2559,7 +2781,9 @@ function getPipelineStage(config, reportDate, now, timezone) {
     return "skip";
   }
 
-  if (!config.schedule?.skipIfBeforePostTime) return "report";
+  // Waiting for the configured post time is the safe default. A member must
+  // explicitly opt out with skipIfBeforePostTime: false.
+  if (config.schedule?.skipIfBeforePostTime === false) return "report";
 
   const parentPostAfterTime = config.schedule?.parentPostAfterTime || process.env.PARENT_POST_AFTER_TIME || "17:25";
   const reportPostAfterTime = getReportPostAfterTime(config, reportDate);

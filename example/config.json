@@ -82,7 +82,8 @@
     "extraWorkDates": [],
     "parentPostAfterTime": "17:28",
     "postAfterTime": "17:30",
-    "postAfterRandomWindowMinutes": 20
+    "postAfterRandomWindowMinutes": 20,
+    "skipIfBeforePostTime": true
   },
   "report": {
     "numberTemplate": "T{MM}/{REPORT_INDEX}/{MONTH_WORKDAYS}",
@@ -110,13 +111,13 @@
   "innovations": [],
   "auth": {
     "common": {
-      "clientId": "5e3ce6c0-2b1f-4285-8d4b-75ee78787346",
+      "clientId": "",
       "redirectUri": "https://teams.cloud.microsoft/v2/authv2",
-      "brkClientId": "5e3ce6c0-2b1f-4285-8d4b-75ee78787346",
+      "brkClientId": "",
       "brkRedirectUri": "https://teams.cloud.microsoft/v2/authv2",
       "includeBrkFields": false,
-      "anchorMailbox": "Oid:<user-oid>@<tenant-id>",
-      "refreshToken": "PASTE_TEAMS_WEB_REFRESH_TOKEN_HERE"
+      "anchorMailbox": "",
+      "refreshToken": ""
     },
     "spaces": {
       "scope": "https://api.spaces.skype.com/.default openid profile offline_access",
