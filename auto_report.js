@@ -148,10 +148,29 @@ async function runPipelineForMember(member, args) {
       persistMember(member);
     }
 
-    const refreshedProfiles = await refreshAuthProfilesIfNeeded(config);
-    if (refreshedProfiles.length) {
+    let authRefreshResult = await refreshAuthProfilesIfNeeded(config);
+    if (authRefreshResult.refreshedProfiles.length) {
       persistMember(member);
-      console.log(`[INFO][${config.id}] Refreshed auth profile(s): ${refreshedProfiles.join(", ")}.`);
+      console.log(`[INFO][${config.id}] Refreshed auth profile(s): ${authRefreshResult.refreshedProfiles.join(", ")}.`);
+    }
+
+    if (authRefreshResult.browserRenewRequired) {
+      console.warn(`[WARN][${config.id}] Refresh token is no longer usable. Starting browser renew now.`);
+      const retryBrowserRenewResult = await renewBrowserTokenForMember(member, {
+        reason: "refresh-token-rejected"
+      });
+      if (retryBrowserRenewResult.changed) {
+        persistMember(member);
+      }
+      if (retryBrowserRenewResult.renewed) {
+        authRefreshResult = await refreshAuthProfilesIfNeeded(config);
+        persistMember(member);
+        if (authRefreshResult.refreshedProfiles.length) {
+          console.log(
+            `[INFO][${config.id}] Refreshed auth profile(s) after browser renew: ${authRefreshResult.refreshedProfiles.join(", ")}.`
+          );
+        }
+      }
     }
   }
 
@@ -697,6 +716,7 @@ async function forceRefreshAccessToken(config = {}, authKey = "auth") {
 
 async function refreshAuthProfilesIfNeeded(config = {}) {
   const refreshedProfiles = [];
+  let browserRenewRequired = false;
 
   for (const authKey of AUTH_KEEPALIVE_PROFILES) {
     if (!config.auth?.[authKey]) continue;
@@ -722,10 +742,21 @@ async function refreshAuthProfilesIfNeeded(config = {}) {
       }
     } catch (error) {
       console.warn(`[WARN][${config.id || "member"}][${authKey}] Auth keepalive failed: ${error.message}`);
+      if (isRefreshTokenReauthenticationError(error)) {
+        browserRenewRequired = true;
+      }
     }
   }
 
-  return refreshedProfiles;
+  return { refreshedProfiles, browserRenewRequired };
+}
+
+function isRefreshTokenReauthenticationError(error) {
+  const message = String(error?.message || "");
+  return (
+    Number(error?.status) === 400 &&
+    (message.includes("invalid_grant") || message.includes("AADSTS700084"))
+  );
 }
 
 function hasRefreshTokenSource(config, auth, authKey, cached) {
@@ -777,7 +808,17 @@ function saveTokenForConfig(config, cacheFile, token, authKey = "auth") {
   const auth = getAuthProfile(config, authKey);
   const writableAuth = getWritableAuthProfile(config, authKey);
   if (auth && auth.storeTokenInMember !== false && writableAuth) {
-    writableAuth.token = token;
+    const previousToken = writableAuth.token || {};
+    writableAuth.token = {
+      ...previousToken,
+      ...token,
+      refreshTokenExpiresAt:
+        token.refreshTokenExpiresAt ||
+        token.refresh_token_expires_at ||
+        previousToken.refreshTokenExpiresAt ||
+        previousToken.refresh_token_expires_at ||
+        null
+    };
     if (token.refreshToken) {
       writableAuth.refreshToken = token.refreshToken;
       syncPrimaryRefreshToken(config, authKey, token.refreshToken);
@@ -1081,7 +1122,7 @@ async function renewBrowserTokenForMember(member, options = {}) {
     return { changed: false, renewed: false };
   }
 
-  const reason = getBrowserRenewReason(config, options);
+  const reason = options.reason || getBrowserRenewReason(config, options);
   if (!reason) {
     return { changed: false, renewed: false };
   }
@@ -1130,6 +1171,11 @@ function isBrowserRenewEnabled(config = {}, options = {}) {
 function getBrowserRenewReason(config = {}, options = {}) {
   if (options.force) return "forced";
   if (!getPrimaryRefreshToken(config)) return "missing-common-refresh-token";
+
+  const browserRefreshTokenExpiresAt = config.browserRenewals?.lastRefreshTokenExpiresAt;
+  if (expiresWithin(browserRefreshTokenExpiresAt, getBrowserRenewBeforeMs())) {
+    return "browser-refresh-token-expiring";
+  }
 
   const expiringProfiles = AUTH_KEEPALIVE_PROFILES.filter((authKey) => {
     const auth = config.auth?.[authKey];

@@ -1,57 +1,9 @@
 {
-  "_notes": {
-    "copyTo": "Copy file nay thanh members/<member_id>/config.json roi dien thong tin rieng cua tung nguoi. Copy state.example.json thanh members/<member_id>/state.json.",
-    "importantFields": [
-      "id",
-      "enabled",
-      "auth.common.clientId",
-      "auth.common.brkClientId",
-      "auth.common.anchorMailbox",
-      "auth.common.refreshToken",
-      "teams.threadId",
-      "teams.teamId",
-      "author.from",
-      "author.fromUserId",
-      "author.displayName",
-      "schedule",
-      "tasks"
-    ],
-    "fieldGuide": {
-      "auth.common.clientId": "Client id trong token request. Neu dung Teams web mac dinh thi thuong la 5e3ce6c0-2b1f-4285-8d4b-75ee78787346.",
-      "auth.common.brkClientId": "Gia tri brk_client_id trong token request neu request co brk fields. Thuong giong Teams web client id.",
-      "auth.common.anchorMailbox": "Gia tri X-AnchorMailbox trong token/search request, dang Oid:<user-oid>@<tenant-id>.",
-      "auth.common.refreshToken": "Refresh token lay tu request oauth2/v2.0/token cua Teams web client 5e3ce6c0. Token nay co the dung de doi sang spaces/substrate/ic3 bang scope rieng.",
-      "author.from": "Gia tri from trong payload post/reply Teams, dang 8:orgid:<user-oid>.",
-      "author.fromUserId": "Thuong giong author.from. Neu khong dien, script se fallback ve author.from.",
-      "teams.threadId": "Conversation/channel thread id trong URL/API chatsvc, dang 19:...@thread.tacv2.",
-      "teams.teamId": "Team id trong API/list posts/search query, dang 19:...@thread.tacv2.",
-      "schedule.days": "Danh sach ngay duoc report. Neu bo trong hoac khong khai bao, script chi keepalive token va khong post report."
-    },
-    "tokenGuide": {
-      "primaryRefreshToken": "Uu tien lay refresh_token trong response cua request token co client_id=5e3ce6c0-2b1f-4285-8d4b-75ee78787346. Scope co the la api.spaces.skype.com hoac substrate.office.com.",
-      "spaces": "Script se dung primary refresh token de lay access token aud=https://api.spaces.skype.com.",
-      "substrate": "Script se dung primary refresh token de lay access token aud=https://substrate.office.com, dung de search parent post.",
-      "ic3": "Script se dung primary refresh token de lay access token aud=https://ic3.teams.office.com va scp=Teams.AccessAsUser.All, dung de tao parent post va reply report.",
-      "fallback": "Neu mot profile test-auth fail, them refreshToken rieng vao auth.<profile>.refreshToken.",
-      "firstRun": "Truong auth.<profile>.token se duoc script tu ghi lai sau khi refresh thanh cong.",
-      "commonSync": "Moi khi spaces refresh thanh cong va nhan refresh_token moi, script se cap nhat lai auth.common.refreshToken theo spaces."
-    },
-    "progressGuide": {
-      "startPercent": "Phan tram hien tai truoc khi cong tien do cho ngay report.",
-      "dailyIncreaseRange": "Moi ngay random mot gia tri trong khoang nay va luu vao dailyPlans[date].taskIncreases.",
-      "progressAppliedTasks": "Script tu tao dailyPlans[date].progressAppliedTasks sau khi post thanh cong de khong cong trung."
-    },
-    "reportNumberGuide": {
-      "numberTemplate": "Mac dinh T{MM}/{REPORT_INDEX}/{MONTH_WORKDAYS}. REPORT_INDEX tung ngay duoc luu trong state.postedReports, summary thang nam trong state.monthlyReports.",
-      "skipDates": "Neu nghi mot ngay lam viec, them YYYY-MM-DD vao schedule.skipDates de khong tang so report va khong tinh vao tong ngay lam.",
-      "extraWorkDates": "Neu lam bu vao ngay ngoai schedule.days, them YYYY-MM-DD vao schedule.extraWorkDates.",
-      "initialReportedWorkdays": "Tuy chon. Dung de seed so ngay da report truoc khi bat dau dung bot giua thang."
-    }
-  },
+  
   "id": "your_member_id",
   "enabled": true,
   "teams": {
-    "threadId": "19:<channel-thread-id>@thread.tacv2",
+    "threadId": "19:b217e077bbe6418a8fa79badec25811e@thread.tacv2",
     "teamId": "19:<team-id>@thread.tacv2",
     "conversationLinkPrefix": "https://teams.cloud.microsoft/l/message",
     "searchTitleTemplate": "ADVANCE UAV NAVIGATION SYSTEM - Báo cáo ngày {DD}/{MM}/{YYYY}",
@@ -82,7 +34,7 @@
     "extraWorkDates": [],
     "parentPostAfterTime": "17:28",
     "postAfterTime": "17:30",
-    "postAfterRandomWindowMinutes": 20,
+    "postAfterRandomWindowMinutes": 15,
     "skipIfBeforePostTime": true
   },
   "report": {
