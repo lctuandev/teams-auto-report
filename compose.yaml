@@ -6,9 +6,35 @@ services:
     restart: unless-stopped
     working_dir: /app
     command: npm run watch
+    environment:
+      BROWSER_RENEW_EXECUTABLE_PATH: /usr/bin/chromium
+      BROWSER_RENEW_HEADLESS: "true"
     volumes:
       - ./.env:/app/.env:ro
-      - ./members:/app/members
+      - ./users:/app/users
       - ./.locks:/app/.locks
       - ./.state:/app/.state
       - ./.browser-profiles:/app/.browser-profiles
+      - ./groups:/app/groups:ro
+
+  report-web:
+    build:
+      context: ./web
+    container_name: teams-auto-report-web
+    restart: unless-stopped
+    user: "${WEB_UID:-1000}:${WEB_GID:-1000}"
+    depends_on:
+      - teams-report
+    environment:
+      AUTH_SECRET: ${WEB_AUTH_SECRET:?Set WEB_AUTH_SECRET to at least 32 characters}
+      AUTH_COOKIE_SECURE: ${WEB_COOKIE_SECURE:-}
+      JSON_DATA_ROOT: /data
+      NODE_ENV: production
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    volumes:
+      - ./groups:/data/groups
+      - ./users:/data/users
+      - ./audit:/data/audit
+      - ./.state:/data/.state
+      - ./.locks:/data/.locks

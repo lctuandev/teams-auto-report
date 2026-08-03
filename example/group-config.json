@@ -1,0 +1,23 @@
+{
+  "id": "your_group_id",
+  "name": "Your Group",
+  "enabled": true,
+  "teams": {
+    "threadId": "19:<channel-id>@thread.tacv2",
+    "teamId": "19:<team-id>@thread.tacv2",
+    "conversationLinkPrefix": "https://teams.cloud.microsoft/l/message"
+  },
+  "parentPost": {
+    "searchTitleTemplate": "YOUR GROUP - Báo cáo ngày {DD}/{MM}/{YYYY}",
+    "contentTemplate": "<p>YOUR GROUP - Báo cáo ngày {DD}/{MM}/{YYYY}</p>",
+    "timezone": "Asia/Bangkok",
+    "days": [1, 2, 3, 4, 5],
+    "skipDates": [],
+    "extraWorkDates": [],
+    "postAfterTime": "17:28"
+  },
+  "createdBy": "your_admin_id",
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "updatedAt": "2026-01-01T00:00:00.000Z",
+  "version": 1
+}

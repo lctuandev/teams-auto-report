@@ -4,7 +4,7 @@ Bot tự động tạo hoặc tìm post cha trong Microsoft Teams channel, sau �
 
 ## Tính Năng Chính
 
-- Hỗ trợ nhiều member qua folder `members/<member_id>/`.
+- Hỗ trợ nhiều member qua folder hợp nhất `users/<member_id>/`.
 - Mỗi member có `config.json` riêng và `state.json` riêng.
 - Tự refresh access token cho các domain auth: `spaces`, `substrate`, `ic3`.
 - Tự sync refresh token mới từ `spaces` về `auth.common.refreshToken`.
@@ -17,13 +17,14 @@ Bot tự động tạo hoặc tìm post cha trong Microsoft Teams channel, sau �
 - Random phần trăm tăng task mỗi ngày, lưu lại để không random lại.
 - Tính `Số báo cáo` theo format `T{tháng}/{số ngày đã report}/{tổng ngày làm trong tháng}`.
 - Hỗ trợ ngày nghỉ (`skipDates`) và ngày làm bù (`extraWorkDates`).
+- Group UI hỗ trợ áp dụng lịch nghỉ hành chính Việt Nam theo năm và chọn nhiều ngày bằng date picker.
 - Hỗ trợ Docker/Compose để chạy nền.
 
 ## Luồng Hoạt Động
 
 Mỗi lần pipeline chạy cho một member:
 
-1. Load `.env`, `members/<member_id>/config.json`, và `members/<member_id>/state.json`.
+1. Load `.env`, `users/<member_id>/config.json`, và `users/<member_id>/state.json`.
 2. Nếu refresh token sắp hết hạn, tự renew bằng browser profile.
 3. Refresh/keepalive token nếu token sắp hết hạn.
 4. Kiểm tra ngày hiện tại có nằm trong `schedule.days` hay không.
@@ -46,12 +47,21 @@ Mỗi lần pipeline chạy cho một member:
 |-- auto_report.js
 |-- .env
 |-- example/
-|   |-- example.json
-|   `-- state.example.json
-|-- members/
+|   |-- config.json
+|   |-- credentials.json
+|   |-- group-config.json
+|   `-- state.json
+|-- users/
 |   `-- <member_id>/
+|       |-- account.json
 |       |-- config.json
+|       |-- credentials.json
 |       `-- state.json
+|-- groups/
+|   `-- <group_id>/
+|       `-- config.json
+|-- audit/
+|   `-- events.jsonl
 |-- .state/
 |   `-- parent-posts.json
 |-- .browser-profiles/
@@ -63,46 +73,53 @@ Mỗi lần pipeline chạy cho một member:
 
 - `auto_report.js`: script chính.
 - `.env`: config dùng chung cho mọi member, không nên commit.
-- `example/example.json`: template config cho member mới.
-- `example/state.example.json`: template state rỗng.
-- `members/<member_id>/config.json`: config sửa tay của từng member.
-- `members/<member_id>/state.json`: state do script tự ghi.
+- `example/config.json`: template config nghiệp vụ cho member mới.
+- `example/credentials.json`: template Teams credentials/browser riêng.
+- `example/group-config.json`: template group/parent post.
+- `example/state.json`: template state rỗng.
+- `users/<member_id>/account.json`: credential và quyền đăng nhập web; member chưa có tài khoản có thể không có file này.
+- `users/<member_id>/config.json`: config sửa tay của từng member.
+- `users/<member_id>/credentials.json`: `auth` và cấu hình browser riêng để token refresh không ghi vào config nghiệp vụ.
+- `users/<member_id>/state.json`: state do script tự ghi.
+- `groups/<group_id>/config.json`: Teams target, lịch tạo parent và template dùng chung của group.
+- `audit/events.jsonl`: audit log do Web ghi.
 - `.state/parent-posts.json`: cache post cha dùng chung.
 - `.browser-profiles/<member_id>/`: browser session/cookie dùng để renew refresh token.
-- `.locks/`: lock file để tránh nhiều process cùng tạo/post trùng.
+- `.locks/`: lock dùng chung giữa Web và bot (`member-<id>.lock`) để tránh ghi đè config, cùng lock parent để tránh tạo post trùng.
 
 ## Setup Member Mới
 
 Tạo folder member:
 
 ```txt
-members/<member_id>/
+users/<member_id>/
 ```
 
 Copy file mẫu:
 
 ```txt
-example/example.json -> members/<member_id>/config.json
-example/state.example.json -> members/<member_id>/state.json
+example/config.json -> users/<member_id>/config.json
+example/credentials.json -> users/<member_id>/credentials.json
+example/state.json -> users/<member_id>/state.json
+example/group-config.json -> groups/<group_id>/config.json
 ```
 
-Các field bắt buộc cần sửa trong `config.json`:
+Các field nghiệp vụ bắt buộc trong `config.json`:
 
 ```txt
 id
 enabled
-teams.threadId
-teams.teamId
-teams.searchTitleTemplate
-author.from
-author.fromUserId
 author.displayName
+groupId
+version
 schedule
 report
 tasks
-auth.common.anchorMailbox
-auth.common.refreshToken
 ```
+
+Teams target nằm trong `groups/<group_id>/config.json`. `auth`, browser config
+và Teams author identity nằm trong `credentials.json`; không đặt các field này
+trở lại `config.json`.
 
 ## File `.env`
 
@@ -119,7 +136,7 @@ POST_API_BASE_URL=https://teams.cloud.microsoft/api/chatsvc/apac/v1/users/ME/con
 
 REPORT_TIMEZONE=Asia/Bangkok
 WATCH_INTERVAL_MINUTES=10
-TOKEN_REFRESH_BEFORE_HOURS=12
+ACCESS_TOKEN_REFRESH_BEFORE_MINUTES=10
 BROWSER_RENEW_BEFORE_HOURS=8
 BROWSER_RENEW_RETRY_MINUTES=60
 AUTO_BROWSER_RENEW=true
@@ -133,7 +150,7 @@ Một số key quan trọng:
 
 - `AUTH_REFRESH_URL`: token endpoint của tenant.
 - `WATCH_INTERVAL_MINUTES`: khoảng cách mỗi lần `--watch` check pipeline.
-- `TOKEN_REFRESH_BEFORE_HOURS`: refresh token sớm nếu refresh token còn dưới số giờ này.
+- `ACCESS_TOKEN_REFRESH_BEFORE_MINUTES`: refresh access token khi còn dưới số phút này; nên nhỏ hơn lifetime access token để watch không refresh ở mọi vòng.
 - `BROWSER_RENEW_BEFORE_HOURS`: nếu refresh token còn dưới số giờ này, watch sẽ thử lấy refresh token mới qua browser profile.
 - `BROWSER_RENEW_RETRY_MINUTES`: cooldown giữa các lần browser renew để tránh mở browser liên tục.
 - `AUTO_BROWSER_RENEW`: bật/tắt auto browser renew trong watch. Set `false` nếu muốn tắt.
@@ -175,6 +192,9 @@ Template hỗ trợ các biến:
 
 ## Config `author`
 
+`displayName` nằm trong `config.json`. Các identity dùng để gọi Teams như
+`from` và `fromUserId` nằm trong `credentials.json`:
+
 ```json
 "author": {
   "from": "8:orgid:<user-oid>",
@@ -192,6 +212,9 @@ Template hỗ trợ các biến:
 `user-oid` cũng là phần dùng trong `auth.common.anchorMailbox`.
 
 ## Config `browser`
+
+Phần này nằm trong `users/<member_id>/credentials.json`, không nằm trong
+`config.json`:
 
 ```json
 "browser": {
@@ -253,7 +276,8 @@ Nếu `schedule.days` không có hoặc là mảng rỗng, member chỉ được
 "report": {
   "numberTemplate": "T{MM}/{REPORT_INDEX}/{MONTH_WORKDAYS}",
   "initialReportedWorkdaysByMonth": {},
-  "countProgressByWorkdaysOnly": true
+  "countProgressByWorkdaysOnly": true,
+  "excludeCompletedTasks": false
 }
 ```
 
@@ -262,6 +286,9 @@ Nếu `schedule.days` không có hoặc là mảng rỗng, member chỉ được
 - `numberTemplate`: format cho cột `Số báo cáo`.
 - `initialReportedWorkdaysByMonth`: override số ngày đã report trước khi bot bắt đầu track, theo từng tháng.
 - `countProgressByWorkdaysOnly`: nếu `true`, progress chỉ tăng trong ngày hợp lệ theo schedule.
+- `excludeCompletedTasks`: mặc định `false`. Khi bật, task có
+  `startPercent >= 100` vẫn được giữ trên UI nhưng không xuất hiện trong daily
+  report.
 
 Ví dụ override số ngày đã report trong tháng 7:
 
@@ -386,7 +413,7 @@ Nếu để mảng rỗng, bot vẫn render tối thiểu 2 dòng trong mỗi se
 
 ## Config `auth`
 
-Auth được tách theo domain:
+Auth nằm trong `users/<member_id>/credentials.json` và được tách theo domain:
 
 ```json
 "auth": {
@@ -401,17 +428,14 @@ Auth được tách theo domain:
   },
   "spaces": {
     "scope": "https://api.spaces.skype.com/.default openid profile offline_access",
-    "storeTokenInMember": true,
     "reusePrimaryRefreshToken": true
   },
   "substrate": {
     "scope": "https://substrate.office.com/.default openid profile offline_access",
-    "storeTokenInMember": true,
     "reusePrimaryRefreshToken": true
   },
   "ic3": {
     "scope": "https://ic3.teams.office.com/.default openid profile offline_access",
-    "storeTokenInMember": true,
     "reusePrimaryRefreshToken": true,
     "claims": {
       "access_token": {
@@ -450,7 +474,9 @@ Thứ tự ưu tiên refresh token khi refresh một profile:
 6. AUTH_REFRESH_TOKEN trong .env
 ```
 
-Sau khi refresh thành công, token mới được lưu vào `auth.<profile>.token` nếu `storeTokenInMember: true`.
+Sau khi refresh thành công, token mới luôn được lưu riêng vào
+`users/<member_id>/credentials.json` tại `auth.<profile>.token`. Bot không dùng
+token cache dùng chung giữa các thành viên.
 
 ## Lấy Refresh Token
 
@@ -500,7 +526,7 @@ Khi chạy `--watch`, bot refresh token trước khi check lịch post.
 Bot refresh profile nếu:
 
 - Access token đã hết hạn.
-- Refresh token sắp hết hạn trong vòng `TOKEN_REFRESH_BEFORE_HOURS`.
+- Refresh token sắp hết hạn trong vòng `BROWSER_RENEW_BEFORE_HOURS`.
 
 Mỗi lần refresh, log sẽ hiện thời gian hết hạn mới:
 
@@ -523,10 +549,10 @@ Bot làm tương tự bằng Playwright:
 5. Bot lưu refresh token mới vào `auth.common.refreshToken`.
 6. Bot cập nhật refresh token mới cho các profile `spaces`, `substrate`, `ic3`.
 
-Lần đầu tiên nên chạy trên máy có GUI:
+Lần đầu tiên nên renew riêng member trên máy có GUI:
 
 ```bash
-npm run watch
+npm run renew-token -- --member <member_id>
 ```
 
 Khi browser mở ra, login Teams/Microsoft như bình thường. Sau đó profile được lưu trong:
@@ -546,7 +572,45 @@ Lưu ý:
 - Tính năng này cần package `playwright-core` và Chrome/Edge đã cài trên máy.
 - Nếu dùng Edge, đổi `BROWSER_RENEW_CHANNEL=msedge` hoặc `browser.channel`.
 - Browser profile chứa cookie/session đăng nhập, nhạy cảm như token.
-- Trong Docker, lần login đầu qua browser khó hơn vì container thường không có GUI. Nên setup/renew browser profile trên máy local trước, hoặc tắt `AUTO_BROWSER_RENEW=false` cho container nếu không dùng được browser.
+- Docker có Chromium headless để tự renew các profile đã đăng nhập. Lần login
+  đầu vẫn nên thực hiện trên máy local có GUI, sau đó dùng chung/copy cả
+  `users/<member_id>/` và `.browser-profiles/<member_id>/`.
+
+## Tạo account và onboarding Teams an toàn
+
+Nút **Mở browser để đăng nhập Teams** trong Web không cần `npm run watch`.
+Web tự chạy một process one-shot tương đương:
+
+```bash
+node auto_report.js --renew-token --member=<member_id>
+```
+
+Process này chỉ đăng nhập/renew token và lưu browser profile; nó không chạy
+scheduler và không đăng daily report.
+
+Quy trình an toàn khi bot đang chạy bằng Docker:
+
+```bash
+# Tại thư mục gốc dự án
+docker compose stop teams-report
+
+# Chỉ chạy Web local
+cd web
+npm run dev
+```
+
+Mở `http://localhost:3000/admin/accounts/new`, tạo account và hoàn thành browser
+login. Sau đó dừng Web local bằng `Ctrl+C`, quay lại thư mục gốc và bật bot:
+
+```bash
+docker compose start teams-report
+```
+
+Không chạy `npm run watch` ở local đồng thời với service `teams-report` trong
+Docker. Local và Docker có thể dùng chung bind volume (`users`, `.state`,
+`.locks`, `.browser-profiles`) nhưng vẫn là hai scheduler độc lập; chạy song
+song có thể tạo hai snapshot và dẫn đến duplicate reply. Chỉ Docker nên sở hữu
+scheduler, còn local chỉ dùng Web và lệnh one-shot `renew-token`.
 
 ## State
 
@@ -658,6 +722,12 @@ Chạy bằng Compose:
 docker compose up -d --build
 ```
 
+Web tự nhận biết protocol tại lần đăng nhập: truy cập trực tiếp bằng HTTP trong
+mạng nội bộ sẽ dùng cookie thường, còn HTTPS (bao gồm
+`X-Forwarded-Proto: https` từ reverse proxy) sẽ dùng cookie `Secure`. Có thể ép
+chế độ bằng `WEB_COOKIE_SECURE=true|false`; môi trường public nên dùng HTTPS và
+đặt `true`.
+
 Xem log:
 
 ```bash
@@ -674,17 +744,61 @@ Compose mount các runtime path:
 
 ```txt
 .env -> /app/.env
-members -> /app/members
+users -> /app/users
 .locks -> /app/.locks
 .state -> /app/.state
 .browser-profiles -> /app/.browser-profiles
+groups -> /app/groups
 ```
+
+## Chuẩn hóa và backup dữ liệu
+
+Kiểm tra schema member mà không ghi file:
+
+```bash
+npm run data:normalize
+```
+
+Apply sau khi xem dry-run:
+
+```bash
+npm run data:normalize -- --apply
+```
+
+Lệnh apply tự tạo snapshot phục hồi trong `.backups/`. Migration hiện chuẩn
+hóa `version`, `report.numberTemplate`, `skipDates`, `extraWorkDates` và loại
+`reportNumberTemplate`/`dailyStatuses` legacy. Chạy lại dry-run sau apply phải
+trả về `0` thay đổi.
+
+Các migration one-time của cấu trúc cũ được lưu tại `scripts/migrations/` để
+tham khảo và không còn được expose qua npm scripts.
+
+## Lịch nghỉ Việt Nam và tăng ca
+
+Trong trang tạo/sửa group, admin có thể áp dụng lịch nghỉ hành chính Việt Nam
+đã được công bố cho từng năm. Lịch 2026 bao gồm cả ngày nghỉ hoán đổi và ngày
+làm bù theo thông báo của Bộ Nội vụ; dữ liệu có liên kết nguồn Chính phủ ngay
+trên UI. Admin vẫn có thể thêm/xóa ngày bằng date picker để phù hợp lịch riêng
+của doanh nghiệp.
+
+Thứ tự ưu tiên khi bot quyết định có báo cáo:
+
+1. `member.report.skipDates`: member chủ động nghỉ.
+2. `member.report.extraWorkDates`: member xác nhận tăng ca trên Home.
+3. `group.parentPost.skipDates` và `extraWorkDates`.
+4. Các thứ làm việc bình thường trong `group.parentPost.days`.
+
+Vì vậy ngày nghỉ lễ của group áp dụng cho mọi member, nhưng một member chọn
+“Hôm nay tôi sẽ báo cáo” vẫn có thể tạo parent chung và reply riêng.
 
 ## Bảo Mật
 
 - Không commit `.env`.
-- Không commit `members/*/config.json`, vì có refresh token/access token.
-- Không commit `members/*/state.json` nếu không muốn lộ lịch sử post.
+- Không commit `users/*/account.json`, vì chứa password hash và quyền đăng nhập.
+- Không commit `users/*/config.json`, vì chứa cấu hình và nội dung báo cáo nội bộ.
+- Không commit `users/*/credentials.json`, vì chứa refresh token/access token và thiết lập browser.
+- Không commit `users/*/state.json` nếu không muốn lộ lịch sử post.
+- Không commit `groups/*/config.json`, `audit/*.jsonl`, `.state/` hoặc `.backups/`; đây là runtime data được backup/deploy riêng.
 - Không commit `.browser-profiles/`, vì có cookie/session Microsoft.
 - Không paste token lên website decode public.
 - Nếu token lộ, logout Teams web và lấy refresh token mới.

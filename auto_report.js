@@ -46,10 +46,12 @@ const DAY_INDEX = {
   t7: 6
 };
 
-main().catch((error) => {
-  console.error(`[ERROR] ${error.message}`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`[ERROR] ${error.message}`);
+    process.exitCode = 1;
+  });
+}
 
 async function main() {
   loadDotEnv(path.join(ROOT, ".env"));
@@ -67,7 +69,7 @@ async function main() {
     for (const member of members) {
       const authKey = typeof args["test-auth"] === "string" ? args["test-auth"] : "auth";
       const token = await getAccessToken(member.config, authKey);
-      persistMember(member);
+      persistCredentials(member);
       console.log(`[INFO][${member.config.id}][${authKey}] Auth OK. Access token length: ${token.length}.`);
     }
     return;
@@ -77,7 +79,7 @@ async function main() {
     for (const member of members) {
       const renewResult = await renewBrowserTokenForMember(member, { force: true });
       if (renewResult.changed) {
-        persistMember(member);
+        persistCredentials(member, { state: true });
       }
       if (renewResult.renewed) {
         console.log(`[INFO][${member.config.id}] Browser token renew completed.`);
@@ -96,12 +98,13 @@ async function main() {
             );
           }
         }
-        persistMember(member);
+        persistCredentials(member, { state: true });
         if (profileFailure) {
           process.exitCode = 1;
         }
       } else {
         console.log(`[INFO][${member.config.id}] Browser token renew skipped or failed.`);
+        process.exitCode = 1;
       }
     }
     return;
@@ -111,10 +114,12 @@ async function main() {
   for (const member of members) {
     let releaseLock = null;
     try {
+      let activeMember = member;
       if (!args["dry-run"] && !args.dryRun) {
         releaseLock = acquireMemberRunLock(member.config.id);
+        activeMember = loadMemberConfigs(member.config.id)[0];
       }
-      await runPipelineForMember(member, args);
+      await runPipelineForMember(activeMember, args);
     } catch (error) {
       hasFailure = true;
       console.error(`[ERROR][${member.config.id}] ${error.message}`);
@@ -145,12 +150,12 @@ async function runPipelineForMember(member, args) {
   if (!force && !dryRun) {
     const browserRenewResult = await renewBrowserTokenForMember(member);
     if (browserRenewResult.changed) {
-      persistMember(member);
+      persistCredentials(member, { state: true });
     }
 
     let authRefreshResult = await refreshAuthProfilesIfNeeded(config);
     if (authRefreshResult.refreshedProfiles.length) {
-      persistMember(member);
+      persistCredentials(member);
       console.log(`[INFO][${config.id}] Refreshed auth profile(s): ${authRefreshResult.refreshedProfiles.join(", ")}.`);
     }
 
@@ -160,11 +165,11 @@ async function runPipelineForMember(member, args) {
         reason: "refresh-token-rejected"
       });
       if (retryBrowserRenewResult.changed) {
-        persistMember(member);
+        persistCredentials(member, { state: true });
       }
       if (retryBrowserRenewResult.renewed) {
         authRefreshResult = await refreshAuthProfilesIfNeeded(config);
-        persistMember(member);
+        persistCredentials(member, { state: true });
         if (authRefreshResult.refreshedProfiles.length) {
           console.log(
             `[INFO][${config.id}] Refreshed auth profile(s) after browser renew: ${authRefreshResult.refreshedProfiles.join(", ")}.`
@@ -180,7 +185,7 @@ async function runPipelineForMember(member, args) {
       return;
     }
     if (ensureDailyPlan(config, reportDate)) {
-      persistMember(member);
+      persistState(member);
     }
     if (isReportAlreadyPosted(config, reportDateIso)) {
       return;
@@ -201,7 +206,7 @@ async function runPipelineForMember(member, args) {
   } else {
     accessToken = await getAccessToken(config, postProfileKey);
     if (!dryRun) {
-      persistMember(member);
+      persistCredentials(member);
     }
     console.log(`[INFO][${config.id}] Searching parent post: ${title}`);
     const parentPostResult = await withAuthRetry(
@@ -215,7 +220,7 @@ async function runPipelineForMember(member, args) {
     accessToken = parentPostResult.accessToken;
     parentPost = parentPostResult.value;
     if (!dryRun && parentPost.createdOrFound) {
-      persistMember(member);
+      persistCredentials(member, { state: true });
     }
   }
 
@@ -233,7 +238,7 @@ async function runPipelineForMember(member, args) {
   if (!dryRun) {
     if (!accessToken) {
       accessToken = await getAccessToken(config, postProfileKey);
-      persistMember(member);
+      persistCredentials(member);
     }
     const parentWithReplies = await withAuthRetry(
       config,
@@ -285,7 +290,7 @@ async function runPipelineForMember(member, args) {
 
   if (!accessToken) {
     accessToken = await getAccessToken(config, postProfileKey);
-    persistMember(member);
+    persistCredentials(member);
   }
   const replyResult = await withAuthRetry(config, accessToken, (token) =>
     postReply(config, token, threadId, parentMessageId, payload),
@@ -308,34 +313,29 @@ async function runPipelineForMember(member, args) {
   console.log(`[INFO][${config.id}] Updated member progress for ${progressUpdates.length} task(s).`);
 }
 
-function loadMemberConfigs(memberFilter) {
-  const membersDir = path.join(ROOT, "members");
-  if (!fs.existsSync(membersDir)) {
-    throw new Error("members folder was not found.");
+function loadMemberConfigs(memberFilter, rootDir = ROOT) {
+  const usersDir = path.join(rootDir, "users");
+  if (!fs.existsSync(usersDir)) {
+    throw new Error("users folder was not found.");
   }
 
-  const entries = fs.readdirSync(membersDir, { withFileTypes: true });
+  const entries = fs.readdirSync(usersDir, { withFileTypes: true });
   const splitMemberDirs = entries
-    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(membersDir, entry.name, "config.json")))
+    .filter((entry) => entry.isDirectory() && fs.existsSync(path.join(usersDir, entry.name, "config.json")))
     .map((entry) => entry.name)
-    .sort();
-  const splitMemberNames = new Set(splitMemberDirs);
-  const files = entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-    .map((entry) => entry.name)
-    .filter((file) => !splitMemberNames.has(path.basename(file, ".json")))
     .sort();
 
-  if (!splitMemberDirs.length && !files.length) {
-    throw new Error("No member config files were found in members/*/config.json or members/*.json.");
+  if (!splitMemberDirs.length) {
+    throw new Error("No member config files were found in users/*/config.json.");
   }
 
   const members = [];
   for (const dirName of splitMemberDirs) {
-    const memberDir = path.join(membersDir, dirName);
+    const memberDir = path.join(usersDir, dirName);
     const configFilePath = path.join(memberDir, "config.json");
     const stateFilePath = path.join(memberDir, "state.json");
-    const config = loadSplitMemberConfig(configFilePath, stateFilePath, dirName);
+    const credentialsFilePath = path.join(memberDir, "credentials.json");
+    const config = loadSplitMemberConfig(configFilePath, stateFilePath, credentialsFilePath, dirName, rootDir);
     if (!shouldLoadMember(config, memberFilter, dirName)) {
       continue;
     }
@@ -344,25 +344,9 @@ function loadMemberConfigs(memberFilter) {
       filePath: configFilePath,
       configFilePath,
       stateFilePath,
+      credentialsFilePath,
       config
     });
-  }
-
-  for (const file of files) {
-    const filePath = path.join(membersDir, file);
-    const raw = fs.readFileSync(filePath, "utf8").trim();
-    if (!raw) {
-      console.warn(`[WARN] Skipping empty member config: ${file}`);
-      continue;
-    }
-
-    const config = JSON.parse(raw);
-    config.id ||= path.basename(file, ".json");
-    if (!shouldLoadMember(config, memberFilter, path.basename(file, ".json"))) {
-      continue;
-    }
-
-    members.push({ filePath, config });
   }
 
   if (!members.length) {
@@ -372,15 +356,56 @@ function loadMemberConfigs(memberFilter) {
   return members;
 }
 
-function loadSplitMemberConfig(configFilePath, stateFilePath, fallbackId) {
+function loadSplitMemberConfig(configFilePath, stateFilePath, credentialsFilePath, fallbackId, rootDir = ROOT) {
   const config = readJson(configFilePath);
   const state = fs.existsSync(stateFilePath) ? readJson(stateFilePath) : {};
+  const credentials = fs.existsSync(credentialsFilePath) ? readJson(credentialsFilePath) : {};
   config.id ||= fallbackId;
+  config.auth = credentials.auth || config.auth;
+  config.browser = credentials.browser || config.browser;
+  config.author = { ...(config.author || {}), ...(credentials.author || {}) };
 
   for (const key of MEMBER_STATE_KEYS) {
     config[key] = state[key] || config[key] || {};
   }
 
+  return resolveMemberGroupConfig(config, rootDir);
+}
+
+function resolveMemberGroupConfig(config, rootDir = ROOT) {
+  if (!config.groupId) return config;
+  if (!/^[a-z0-9_-]{1,80}$/.test(config.groupId)) {
+    throw new Error(`Invalid groupId for member ${config.id}: ${config.groupId}`);
+  }
+
+  const groupFilePath = path.join(rootDir, "groups", config.groupId, "config.json");
+  if (!fs.existsSync(groupFilePath)) {
+    throw new Error(`Group config was not found for member ${config.id}: ${config.groupId}`);
+  }
+  const group = readJson(groupFilePath);
+  if (group.id !== config.groupId) throw new Error(`Group directory and config ID do not match: ${config.groupId}`);
+  if (group.enabled === false) throw new Error(`Group is disabled for member ${config.id}: ${config.groupId}`);
+  if (!group.teams?.threadId || !group.teams?.teamId || !group.parentPost?.searchTitleTemplate) {
+    throw new Error(`Group config is incomplete: ${config.groupId}`);
+  }
+
+  const memberSchedule = config.schedule || {};
+  config.teams = {
+    ...group.teams,
+    searchTitleTemplate: group.parentPost.searchTitleTemplate,
+    parentPostContentTemplate: group.parentPost.contentTemplate
+  };
+  config.schedule = {
+    timezone: group.parentPost.timezone,
+    days: group.parentPost.days,
+    skipDates: group.parentPost.skipDates || [],
+    extraWorkDates: group.parentPost.extraWorkDates || [],
+    parentPostAfterTime: group.parentPost.postAfterTime,
+    postAfterTime: memberSchedule.postAfterTime || "17:30",
+    postAfterRandomWindowMinutes: memberSchedule.postAfterRandomWindowMinutes ?? 0,
+    skipIfBeforePostTime: memberSchedule.skipIfBeforePostTime !== false
+  };
+  Object.defineProperty(config, "__groupConfig", { value: group, enumerable: false });
   return config;
 }
 
@@ -399,9 +424,13 @@ function shouldLoadMember(config, memberFilter, fallbackId) {
 
 function persistMember(member) {
   if (member.configFilePath && member.stateFilePath) {
-    const { configData, stateData } = splitMemberConfigAndState(member.config);
+    const { configData, stateData, credentialsData } = splitMemberConfigAndState(member.config);
+    const currentVersion = Number(configData.version) || 1;
+    configData.version = currentVersion + 1;
+    member.config.version = configData.version;
     writeJson(member.configFilePath, configData);
     writeJson(member.stateFilePath, stateData);
+    if (member.credentialsFilePath) writeJson(member.credentialsFilePath, credentialsData);
     return;
   }
 
@@ -411,13 +440,48 @@ function persistMember(member) {
 function splitMemberConfigAndState(config) {
   const configData = { ...config };
   const stateData = {};
+  const credentialsData = {
+    auth: configData.auth || {},
+    browser: configData.browser || {},
+    author: configData.author || {}
+  };
+  delete configData.auth;
+  delete configData.browser;
 
   for (const key of MEMBER_STATE_KEYS) {
     stateData[key] = configData[key] || {};
     delete configData[key];
   }
 
-  return { configData, stateData };
+  if (config.groupId && config.__groupConfig) {
+    delete configData.teams;
+    configData.schedule = {
+      postAfterTime: config.schedule?.postAfterTime || "17:30",
+      postAfterRandomWindowMinutes: config.schedule?.postAfterRandomWindowMinutes ?? 0,
+      skipIfBeforePostTime: config.schedule?.skipIfBeforePostTime !== false
+    };
+  }
+
+  return { configData, stateData, credentialsData };
+}
+
+function persistCredentials(member, options = {}) {
+  if (!member.credentialsFilePath) {
+    persistMember(member);
+    return;
+  }
+  const { stateData, credentialsData } = splitMemberConfigAndState(member.config);
+  writeJson(member.credentialsFilePath, credentialsData);
+  if (options.state) writeJson(member.stateFilePath, stateData);
+}
+
+function persistState(member) {
+  if (!member.stateFilePath) {
+    persistMember(member);
+    return;
+  }
+  const { stateData } = splitMemberConfigAndState(member.config);
+  writeJson(member.stateFilePath, stateData);
 }
 
 function acquireMemberRunLock(memberId) {
@@ -446,7 +510,8 @@ function acquireRunLock(lockName, data = {}) {
     }
 
     const stat = fs.statSync(lockFilePath);
-    if (Number.isFinite(staleMs) && staleMs > 0 && Date.now() - stat.mtimeMs > staleMs) {
+    const lockOwnerIsDead = isLockOwnerDead(lockFilePath);
+    if (lockOwnerIsDead || (Number.isFinite(staleMs) && staleMs > 0 && Date.now() - stat.mtimeMs > staleMs)) {
       fs.unlinkSync(lockFilePath);
       return acquireRunLock(lockName, data);
     }
@@ -463,6 +528,18 @@ function acquireRunLock(lockName, data = {}) {
       }
     }
   };
+}
+
+function isLockOwnerDead(lockFilePath) {
+  try {
+    const lock = JSON.parse(fs.readFileSync(lockFilePath, "utf8"));
+    if (!Number.isInteger(lock.pid) || lock.pid <= 0) return false;
+    process.kill(lock.pid, 0);
+    return false;
+  } catch (error) {
+    if (error?.code === "ESRCH") return true;
+    return false;
+  }
 }
 
 async function acquireParentPostLock(cacheKey, data = {}) {
@@ -598,7 +675,7 @@ function readJson(filePath) {
 function writeJson(filePath, data) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tempFilePath = `${filePath}.tmp`;
-  fs.writeFileSync(tempFilePath, `${JSON.stringify(data, null, 2)}\n`, "utf8");
+  fs.writeFileSync(tempFilePath, `${JSON.stringify(data, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
   fs.renameSync(tempFilePath, filePath);
 }
 
@@ -628,8 +705,7 @@ function parseArgs(args) {
 
 async function getAccessToken(config = {}, authKey = "auth") {
   const auth = getAuthProfile(config, authKey);
-  const cacheFile = getTokenCacheFile(config, authKey);
-  const cached = auth?.token || readTokenCache(cacheFile);
+  const cached = auth?.token;
   const envRefreshToken = auth?.refreshTokenEnv ? process.env[auth.refreshTokenEnv] : null;
   const configuredRefreshToken =
     auth?.refreshToken ||
@@ -656,7 +732,7 @@ async function getAccessToken(config = {}, authKey = "auth") {
         config,
         authKey
       );
-      saveTokenForConfig(config, cacheFile, refreshed, authKey);
+      saveTokenForConfig(config, refreshed, authKey);
       return refreshed.accessToken;
     } catch (error) {
       console.warn(`[WARN][${config.id || "member"}][${authKey}] Refresh token failed: ${error.message}`);
@@ -668,7 +744,7 @@ async function getAccessToken(config = {}, authKey = "auth") {
   }
 
   const loggedIn = await login(config, authKey);
-  saveTokenForConfig(config, cacheFile, loggedIn, authKey);
+  saveTokenForConfig(config, loggedIn, authKey);
   return loggedIn.accessToken;
 }
 
@@ -694,8 +770,7 @@ async function withAuthRetry(config, accessToken, operation, authKey = "auth") {
 
 async function forceRefreshAccessToken(config = {}, authKey = "auth") {
   const auth = getAuthProfile(config, authKey);
-  const cacheFile = getTokenCacheFile(config, authKey);
-  const cached = auth?.token || readTokenCache(cacheFile) || {};
+  const cached = auth?.token || {};
   const envRefreshToken = auth?.refreshTokenEnv ? process.env[auth.refreshTokenEnv] : null;
   const refreshToken =
     cached.refreshToken ||
@@ -710,7 +785,7 @@ async function forceRefreshAccessToken(config = {}, authKey = "auth") {
   }
 
   const refreshed = await refreshAccessToken(refreshToken, config, authKey);
-  saveTokenForConfig(config, cacheFile, refreshed, authKey);
+  saveTokenForConfig(config, refreshed, authKey);
   return refreshed.accessToken;
 }
 
@@ -723,8 +798,7 @@ async function refreshAuthProfilesIfNeeded(config = {}) {
 
     try {
       const auth = getAuthProfile(config, authKey);
-      const cacheFile = getTokenCacheFile(config, authKey);
-      const cached = auth?.token || readTokenCache(cacheFile);
+      const cached = auth?.token;
 
       if (!hasRefreshTokenSource(config, auth, authKey, cached)) {
         continue;
@@ -771,20 +845,18 @@ function hasRefreshTokenSource(config, auth, authKey, cached) {
 }
 
 function shouldRefreshAuthCache(cached = {}) {
-  return (
-    isExpired(cached.expiresAt || cached.expires_at) ||
-    expiresWithin(cached.refreshTokenExpiresAt || cached.refresh_token_expires_at, getTokenRefreshBeforeMs())
-  );
+  const accessTokenExpiresAt = cached.expiresAt || cached.expires_at;
+  return isExpired(accessTokenExpiresAt) || expiresWithin(accessTokenExpiresAt, getAccessTokenRefreshBeforeMs());
 }
 
-function getTokenRefreshBeforeMs() {
-  const hours = Number(process.env.TOKEN_REFRESH_BEFORE_HOURS || 12);
-  const safeHours = Number.isFinite(hours) && hours > 0 ? hours : 12;
-  return safeHours * 60 * 60 * 1000;
+function getAccessTokenRefreshBeforeMs() {
+  const minutes = Number(process.env.ACCESS_TOKEN_REFRESH_BEFORE_MINUTES || 10);
+  const safeMinutes = Number.isFinite(minutes) && minutes > 0 ? minutes : 10;
+  return safeMinutes * 60 * 1000;
 }
 
 function getBrowserRenewBeforeMs() {
-  const hours = Number(process.env.BROWSER_RENEW_BEFORE_HOURS || process.env.TOKEN_REFRESH_BEFORE_HOURS || 12);
+  const hours = Number(process.env.BROWSER_RENEW_BEFORE_HOURS || 8);
   const safeHours = Number.isFinite(hours) && hours > 0 ? hours : 12;
   return safeHours * 60 * 60 * 1000;
 }
@@ -804,29 +876,23 @@ function isUnauthorizedError(error) {
   return Number(error?.status) === 401;
 }
 
-function saveTokenForConfig(config, cacheFile, token, authKey = "auth") {
-  const auth = getAuthProfile(config, authKey);
+function saveTokenForConfig(config, token, authKey = "auth") {
   const writableAuth = getWritableAuthProfile(config, authKey);
-  if (auth && auth.storeTokenInMember !== false && writableAuth) {
-    const previousToken = writableAuth.token || {};
-    writableAuth.token = {
-      ...previousToken,
-      ...token,
-      refreshTokenExpiresAt:
-        token.refreshTokenExpiresAt ||
-        token.refresh_token_expires_at ||
-        previousToken.refreshTokenExpiresAt ||
-        previousToken.refresh_token_expires_at ||
-        null
-    };
-    if (token.refreshToken) {
-      writableAuth.refreshToken = token.refreshToken;
-      syncPrimaryRefreshToken(config, authKey, token.refreshToken);
-    }
-    return;
+  const previousToken = writableAuth.token || {};
+  const previousRefreshTokenExpiresAt = getUsablePreviousRefreshTokenExpiry(config, previousToken);
+  writableAuth.token = {
+    ...previousToken,
+    ...token,
+    refreshTokenExpiresAt:
+      token.refreshTokenExpiresAt ||
+      token.refresh_token_expires_at ||
+      previousRefreshTokenExpiresAt ||
+      null
+  };
+  if (token.refreshToken) {
+    writableAuth.refreshToken = token.refreshToken;
+    syncPrimaryRefreshToken(config, authKey, token.refreshToken);
   }
-
-  writeTokenCache(cacheFile, token);
 }
 
 function syncPrimaryRefreshToken(config, authKey, refreshToken) {
@@ -838,16 +904,6 @@ function syncPrimaryRefreshToken(config, authKey, refreshToken) {
   config.auth ||= {};
   config.auth.common ||= {};
   config.auth.common.refreshToken = refreshToken;
-}
-
-function getTokenCacheFile(config = {}, authKey = "auth") {
-  const auth = getAuthProfile(config, authKey);
-  const tokenCacheFile =
-    auth?.tokenCacheFile ||
-    config.tokenCacheFile ||
-    process.env.TOKEN_CACHE_FILE ||
-    (authKey === "auth" ? "token.json" : `tokens/${authKey}.json`);
-  return path.resolve(ROOT, tokenCacheFile);
 }
 
 function getAuthProfile(config = {}, authKey = "auth") {
@@ -927,23 +983,6 @@ function getPostProfileKey(config = {}) {
   return config.auth?.ic3 ? "ic3" : "auth";
 }
 
-function readTokenCache(filePath) {
-  if (!fs.existsSync(filePath)) return null;
-  const raw = fs.readFileSync(filePath, "utf8").trim();
-  if (!raw) return null;
-
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function writeTokenCache(filePath, token) {
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  fs.writeFileSync(filePath, `${JSON.stringify(token, null, 2)}\n`, "utf8");
-}
-
 function isExpired(expiresAt) {
   if (!expiresAt) return false;
   return Date.now() >= new Date(expiresAt).getTime() - 60_000;
@@ -961,7 +1000,9 @@ async function refreshAccessToken(refreshToken, config = {}, authKey = "auth") {
     body: request.body
   });
 
-  const token = normalizeTokenResponse(response, refreshToken);
+  const auth = getAuthProfile(config, authKey);
+  const previousRefreshTokenExpiresAt = getUsablePreviousRefreshTokenExpiry(config, auth?.token);
+  const token = normalizeTokenResponse(response, refreshToken, previousRefreshTokenExpiresAt);
   logTokenExpiry(config, authKey, token);
   return token;
 }
@@ -1131,11 +1172,15 @@ async function renewBrowserTokenForMember(member, options = {}) {
   const state = config.browserRenewals;
   const now = Date.now();
   const lastAttemptAt = state.lastAttemptAt ? new Date(state.lastAttemptAt).getTime() : 0;
-  if (!options.force && lastAttemptAt && now - lastAttemptAt < getBrowserRenewRetryMs()) {
+  const runtimeBrowserWasFixed = shouldRetryBrowserRenewAfterRuntimeFix(state);
+  if (!options.force && !runtimeBrowserWasFixed && lastAttemptAt && now - lastAttemptAt < getBrowserRenewRetryMs()) {
     console.log(
       `[INFO][${config.id}] Browser token renew skipped. Last attempt was ${formatMsRemaining(now - lastAttemptAt)} ago.`
     );
     return { changed: false, renewed: false };
+  }
+  if (runtimeBrowserWasFixed) {
+    console.log(`[INFO][${config.id}] Browser runtime is now available. Retrying token renew without waiting for the previous cooldown.`);
   }
 
   state.lastAttemptAt = new Date().toISOString();
@@ -1180,14 +1225,32 @@ function getBrowserRenewReason(config = {}, options = {}) {
   const expiringProfiles = AUTH_KEEPALIVE_PROFILES.filter((authKey) => {
     const auth = config.auth?.[authKey];
     if (!auth) return false;
-    const expiresAt =
-      auth.token?.refreshTokenExpiresAt ||
-      auth.token?.refresh_token_expires_at ||
-      null;
+    const expiresAt = getUsablePreviousRefreshTokenExpiry(config, auth.token);
     return expiresWithin(expiresAt, getBrowserRenewBeforeMs());
   });
 
   return expiringProfiles.length ? `expiring-refresh-token:${expiringProfiles.join(",")}` : "";
+}
+
+function getUsablePreviousRefreshTokenExpiry(config = {}, token = {}) {
+  const expiresAt =
+    token?.refreshTokenExpiresAt ||
+    token?.refresh_token_expires_at ||
+    config.browserRenewals?.lastRefreshTokenExpiresAt ||
+    null;
+  if (!expiresAt) return null;
+
+  const lastBrowserSuccessAt = config.browserRenewals?.lastSuccessAt;
+  const browserExpiryIsUnknown = !config.browserRenewals?.lastRefreshTokenExpiresAt;
+  if (
+    browserExpiryIsUnknown &&
+    lastBrowserSuccessAt &&
+    new Date(lastBrowserSuccessAt).getTime() > new Date(expiresAt).getTime()
+  ) {
+    return null;
+  }
+
+  return expiresAt;
 }
 
 async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
@@ -1199,7 +1262,9 @@ async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
   }
 
   const profileDir = getBrowserProfileDir(config);
-  const headless = parseBoolean(config.browser?.headless ?? process.env.BROWSER_RENEW_HEADLESS, false);
+  // Runtime environment wins here so Docker can force headless mode while the
+  // same persisted member profile remains interactive on an admin workstation.
+  const headless = parseBoolean(process.env.BROWSER_RENEW_HEADLESS ?? config.browser?.headless, false);
   const channel = config.browser?.channel || process.env.BROWSER_RENEW_CHANNEL || "chrome";
   const timeoutMs = Number(config.browser?.timeoutMs || process.env.BROWSER_RENEW_TIMEOUT_MS || 600000);
   const safeTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 600000;
@@ -1216,7 +1281,9 @@ async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
   const launchOptions = {
     headless,
     viewport: { width: 1280, height: 900 },
-    ignoreHTTPSErrors: true
+    ignoreHTTPSErrors: true,
+    chromiumSandbox: false,
+    args: ["--disable-dev-shm-usage"]
   };
   if (channel) {
     launchOptions.channel = channel;
@@ -1230,24 +1297,37 @@ async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
   // A persistent profile can reopen the previous blank OAuth callback tab.
   // Always use a fresh page so the authorization navigation starts cleanly.
   const page = await context.newPage();
+  const tokenWaitController = new AbortController();
 
   try {
     let codeError = null;
     let networkError = null;
-    const tokenFromNetworkPromise = waitForBrowserTokenResponse(page, config, safeTimeoutMs)
+    const tokenFromNetworkPromise = waitForBrowserTokenResponse(
+      page,
+      config,
+      safeTimeoutMs,
+      tokenWaitController.signal
+    )
       .catch((error) => {
         networkError = error;
         return null;
       });
     // Register before goto(): the callback page can remove code/error from its
     // address before page.goto() resolves.
-    const codeFromNavigationPromise = waitForAuthCodeNavigation(page, safeTimeoutMs);
+    const codeFromNavigationPromise = waitForAuthCodeNavigation(
+      page,
+      safeTimeoutMs,
+      tokenWaitController.signal
+    );
     console.log(`[INFO][${config.id}] Opening browser renew start URL: ${startUrl}`);
     await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: safeTimeoutMs });
+    const authorizeUrl = buildBrowserAuthorizeUrl(config, getAuthProfile(config, "common"));
+    console.log(`[INFO][${config.id}] Starting fresh authorization-code flow.`);
+    await page.goto(authorizeUrl, { waitUntil: "domcontentloaded", timeout: safeTimeoutMs });
 
     const tokenFromCodePromise = Promise.race([
       codeFromNavigationPromise,
-      waitForAuthCodeUrl(page, safeTimeoutMs)
+      waitForAuthCodeUrl(page, safeTimeoutMs, tokenWaitController.signal)
     ])
       .then((code) => exchangeAuthorizationCodeForToken(code, config))
       .catch((error) => {
@@ -1265,14 +1345,35 @@ async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
       const details = [codeError?.message, networkError?.message].filter(Boolean).join("; ");
       throw new Error(`Browser renew did not capture a refresh token.${details ? ` ${details}` : ""}`);
     }
+    tokenWaitController.abort();
+    if (token.refreshTokenExpiresAt && expiresWithin(token.refreshTokenExpiresAt, getBrowserRenewBeforeMs())) {
+      throw new Error(
+        `Browser authorization returned a refresh token that is still expiring soon (${formatExpiryForLog(token.refreshTokenExpiresAt)}).`
+      );
+    }
 
     return token;
   } finally {
+    tokenWaitController.abort();
     if (config.browserRenewals) {
       delete config.browserRenewals.currentCodeVerifier;
     }
     await context.close();
   }
+}
+
+function shouldRetryBrowserRenewAfterRuntimeFix(state = {}) {
+  const lastError = String(state.lastError || "");
+  if (
+    !lastError.includes("Chromium distribution") &&
+    !lastError.includes("Executable doesn't exist") &&
+    !lastError.includes("executable doesn't exist")
+  ) {
+    return false;
+  }
+
+  const executablePath = process.env.BROWSER_RENEW_EXECUTABLE_PATH;
+  return Boolean(executablePath && fs.existsSync(executablePath));
 }
 
 function loadPlaywright() {
@@ -1348,11 +1449,14 @@ function base64Url(buffer) {
     .replace(/=+$/g, "");
 }
 
-async function waitForAuthCodeUrl(page, timeoutMs) {
+async function waitForAuthCodeUrl(page, timeoutMs, signal) {
   const deadline = Date.now() + timeoutMs;
   let lastUrl = "";
 
   while (Date.now() < deadline) {
+    if (signal?.aborted) {
+      throw new Error("OAuth callback wait was cancelled.");
+    }
     const currentUrl = page.url();
     if (currentUrl !== lastUrl) {
       lastUrl = currentUrl;
@@ -1376,11 +1480,16 @@ function extractAuthCodeFromUrl(rawUrl) {
   return extractAuthCallbackFromUrl(rawUrl).code;
 }
 
-function waitForAuthCodeNavigation(page, timeoutMs) {
+function waitForAuthCodeNavigation(page, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timer);
       page.off("request", onRequest);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("OAuth callback navigation wait was cancelled."));
     };
     const onRequest = (request) => {
       const callback = extractAuthCallbackFromUrl(request.url());
@@ -1402,6 +1511,8 @@ function waitForAuthCodeNavigation(page, timeoutMs) {
     }, timeoutMs);
 
     page.on("request", onRequest);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }
 
@@ -1438,13 +1549,23 @@ function sanitizeAuthUrlForLog(rawUrl) {
   }
 }
 
-async function waitForBrowserTokenResponse(page, config, timeoutMs) {
+async function waitForBrowserTokenResponse(page, config, timeoutMs, signal) {
   return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      page.off("response", onResponse);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new Error("Teams browser token response wait was cancelled."));
+    };
     const timer = setTimeout(() => {
+      cleanup();
       reject(new Error("Timeout waiting for Teams browser token response."));
     }, timeoutMs);
 
-    page.on("response", async (response) => {
+    const onResponse = async (response) => {
       try {
         if (!isMicrosoftTokenUrl(response.url()) || response.request().method() !== "POST") {
           return;
@@ -1462,7 +1583,7 @@ async function waitForBrowserTokenResponse(page, config, timeoutMs) {
           return;
         }
 
-        clearTimeout(timer);
+        cleanup();
         const token = normalizeTokenResponse(tokenResponse);
         token.browserMetadata = extractBrowserAuthMetadata(
           token,
@@ -1472,10 +1593,14 @@ async function waitForBrowserTokenResponse(page, config, timeoutMs) {
         );
         resolve(token);
       } catch (error) {
-        clearTimeout(timer);
+        cleanup();
         reject(error);
       }
-    });
+    };
+
+    page.on("response", onResponse);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
   });
 }
 
@@ -1490,7 +1615,7 @@ function isMicrosoftTokenUrl(rawUrl) {
 
 function isPreferredBrowserTokenRequest(config, rawUrl, requestParams, tokenResponse) {
   const grantType = requestParams.get("grant_type") || "";
-  if (grantType && !["authorization_code", "refresh_token"].includes(grantType)) {
+  if (grantType !== "authorization_code") {
     return false;
   }
 
@@ -1626,9 +1751,11 @@ function saveBrowserRefreshToken(config, token) {
     config.auth[authKey].refreshToken = token.refreshToken;
     config.auth[authKey].token ||= {};
     config.auth[authKey].token.refreshToken = token.refreshToken;
-    if (token.refreshTokenExpiresAt) {
-      config.auth[authKey].token.refreshTokenExpiresAt = token.refreshTokenExpiresAt;
-    }
+    // A newly issued token must never inherit the previous token's expiry.
+    // Microsoft does not always include refresh_token_expires_in in the
+    // authorization-code response; null means unknown, not already expired.
+    config.auth[authKey].token.refreshTokenExpiresAt = token.refreshTokenExpiresAt || null;
+    delete config.auth[authKey].token.refresh_token_expires_at;
   }
 }
 
@@ -1688,7 +1815,7 @@ async function login(config = {}, authKey = "auth") {
   return normalizeTokenResponse(response);
 }
 
-function normalizeTokenResponse(response, fallbackRefreshToken) {
+function normalizeTokenResponse(response, fallbackRefreshToken, fallbackRefreshTokenExpiresAt = null) {
   const accessToken =
     response.accessToken || response.access_token || response.token || response.data?.accessToken;
   const refreshToken =
@@ -1715,7 +1842,9 @@ function normalizeTokenResponse(response, fallbackRefreshToken) {
     response.refresh_token_expires_at ||
     response.data?.refreshTokenExpiresAt ||
     response.data?.refresh_token_expires_at ||
-    (refreshTokenExpiresIn ? new Date(Date.now() + refreshTokenExpiresIn * 1000).toISOString() : null);
+    (refreshTokenExpiresIn ? new Date(Date.now() + refreshTokenExpiresIn * 1000).toISOString() : null) ||
+    fallbackRefreshTokenExpiresAt ||
+    null;
 
   if (!accessToken) {
     throw new Error("Auth response does not contain an access token.");
@@ -2006,7 +2135,9 @@ async function findOrCreateParentPost(config, accessToken, title, reportDateIso,
     }
 
     const parentPost = await searchOrCreateParentPostUnderLock(config, accessToken, title, reportDateIso, options);
-    writeGlobalParentPost(parentCacheKey, parentPost);
+    if (options.allowCreate !== false) {
+      writeGlobalParentPost(parentCacheKey, parentPost);
+    }
     return parentPost;
   } finally {
     releaseParentLock();
@@ -2033,7 +2164,8 @@ async function searchOrCreateParentPostUnderLock(config, accessToken, title, rep
     }
 
     if (options.allowCreate === false) {
-      throw error;
+      console.log(`[DRY_RUN][${config.id}] Parent post does not exist yet and would be created: ${title}`);
+      return buildDryRunParentPost(config, title);
     }
   }
 
@@ -2066,10 +2198,27 @@ async function searchOrCreateParentPostUnderLock(config, accessToken, title, rep
   };
 }
 
+function buildDryRunParentPost(config, title) {
+  const parentMessageId = "dry-run-parent-message-id";
+  return {
+    title,
+    parentMessageId,
+    threadId: config.teams.threadId,
+    clientConversationId: `${config.teams.threadId};messageid=${parentMessageId}`,
+    rank: null,
+    source: "dry-run-would-create",
+    wouldCreate: true,
+    createdOrFound: false
+  };
+}
+
 function getParentPostCacheKey(config, title, reportDateIso) {
+  const parts = config.groupId
+    ? [config.groupId, config.teams.threadId, reportDateIso]
+    : ["legacy", config.teams.threadId, reportDateIso, normalizeParentTitleForCache(title)];
   return crypto
     .createHash("sha256")
-    .update([config.teams.threadId, reportDateIso, normalizeParentTitleForCache(title)].join("|"))
+    .update(parts.join("|"))
     .digest("hex");
 }
 
@@ -2475,7 +2624,7 @@ function buildReportHtml(config, reportDate) {
 }
 
 function buildTaskRows(config, reportDate) {
-  const tasks = config.tasks || [];
+  const tasks = getReportableTasks(config);
   if (!tasks.length) {
     return [
       '<tr><td><span style="font-size:inherit;">1</span></td><td><p data-is-tablecell-container="true">&nbsp;</p></td><td><p>&nbsp;</p></td><td><p data-is-tablecell-container="true">&nbsp;</p></td></tr>'
@@ -2493,6 +2642,12 @@ function buildTaskRows(config, reportDate) {
       "</tr>"
     ].join("");
   });
+}
+
+function getReportableTasks(config = {}) {
+  const tasks = Array.isArray(config.tasks) ? config.tasks : [];
+  if (config.report?.excludeCompletedTasks !== true) return tasks;
+  return tasks.filter((task) => Number(task?.startPercent || 0) < 100);
 }
 
 function getReportNumber(config, reportDate) {
@@ -2674,12 +2829,25 @@ function getOrCreateMonthlyReport(config, reportDate) {
   month.month = reportDate.month;
   month.totalWorkdays = totalWorkdays;
 
-  if (!Number.isFinite(Number(month.baseReportedWorkdays))) {
+  const configuredBase = config.report?.initialReportedWorkdaysByMonth?.[monthKey]
+    ?? config.report?.initialReportedWorkdays;
+  if (Number.isFinite(Number(configuredBase))) {
+    month.baseReportedWorkdays = Math.max(0, Math.floor(Number(configuredBase)));
+    month.baseReportedWorkdaysSource = "override";
+  } else if (month.baseReportedWorkdaysSource === "override") {
     const firstTrackedDateIso = getCheckedReportDatesForMonth(config, monthKey).sort()[0];
     month.baseReportedWorkdays = getInitialBaseReportedWorkdays(
       config,
       firstTrackedDateIso ? parseDate(firstTrackedDateIso) : reportDate
     );
+    month.baseReportedWorkdaysSource = "auto";
+  } else if (!Number.isFinite(Number(month.baseReportedWorkdays))) {
+    const firstTrackedDateIso = getCheckedReportDatesForMonth(config, monthKey).sort()[0];
+    month.baseReportedWorkdays = getInitialBaseReportedWorkdays(
+      config,
+      firstTrackedDateIso ? parseDate(firstTrackedDateIso) : reportDate
+    );
+    month.baseReportedWorkdaysSource = "auto";
   }
   updateMonthlyReportSummary(config, reportDate);
 
@@ -2929,15 +3097,36 @@ function markParentPostChecked(config, reportDateIso, parentPost, source) {
   };
 }
 
+module.exports = {
+  buildDryRunParentPost,
+  getParentPostCacheKey,
+  getOrCreateMonthlyReport,
+  getReportableTasks,
+  getUsablePreviousRefreshTokenExpiry,
+  isAllowedDay,
+  loadMemberConfigs,
+  persistMember,
+  persistCredentials,
+  resolveMemberGroupConfig,
+  saveTokenForConfig,
+  saveBrowserRefreshToken,
+  shouldRetryBrowserRenewAfterRuntimeFix,
+  shouldRefreshAuthCache,
+  splitMemberConfigAndState
+};
+
 function isAllowedDay(config, dateParts) {
   const dateIso = formatIsoDate(dateParts);
-  if (isDateListed(config.schedule?.skipDates, dateIso) || isDateListed(config.report?.skipDates, dateIso)) {
+  if (isDateListed(config.report?.skipDates, dateIso)) {
     return false;
   }
 
-  if (isDateListed(config.schedule?.extraWorkDates, dateIso) || isDateListed(config.report?.extraWorkDates, dateIso)) {
+  if (isDateListed(config.report?.extraWorkDates, dateIso)) {
     return true;
   }
+
+  if (isDateListed(config.schedule?.skipDates, dateIso)) return false;
+  if (isDateListed(config.schedule?.extraWorkDates, dateIso)) return true;
 
   if (Array.isArray(config.schedule?.days) && config.schedule.days.length) {
     const allowedDays = new Set(config.schedule.days.map(dayToIndex));

@@ -1,38 +1,12 @@
 {
-  
   "id": "your_member_id",
   "enabled": true,
-  "teams": {
-    "threadId": "19:b217e077bbe6418a8fa79badec25811e@thread.tacv2",
-    "teamId": "19:<team-id>@thread.tacv2",
-    "conversationLinkPrefix": "https://teams.cloud.microsoft/l/message",
-    "searchTitleTemplate": "ADVANCE UAV NAVIGATION SYSTEM - Báo cáo ngày {DD}/{MM}/{YYYY}",
-    "parentPostContentTemplate": "<p>ADVANCE UAV NAVIGATION SYSTEM - Báo cáo ngày {DD}/{MM}/{YYYY}</p>"
-  },
+  "groupId": "your_group_id",
+  "version": 1,
   "author": {
-    "from": "8:orgid:<user-oid>",
-    "fromUserId": "8:orgid:<user-oid>",
     "displayName": "Your Display Name"
   },
-  "browser": {
-    "autoRenew": true,
-    "profileDir": ".browser-profiles/your_member_id",
-    "channel": "chrome",
-    "headless": false,
-    "timeoutMs": 600000
-  },
   "schedule": {
-    "timezone": "Asia/Bangkok",
-    "days": [
-      1,
-      2,
-      3,
-      4,
-      5
-    ],
-    "skipDates": [],
-    "extraWorkDates": [],
-    "parentPostAfterTime": "17:28",
     "postAfterTime": "17:30",
     "postAfterRandomWindowMinutes": 15,
     "skipIfBeforePostTime": true
@@ -40,60 +14,20 @@
   "report": {
     "numberTemplate": "T{MM}/{REPORT_INDEX}/{MONTH_WORKDAYS}",
     "initialReportedWorkdaysByMonth": {},
-    "countProgressByWorkdaysOnly": true
+    "countProgressByWorkdaysOnly": true,
+    "excludeCompletedTasks": false,
+    "skipDates": [],
+    "extraWorkDates": []
   },
   "tasks": [
     {
+      "id": "task_feature_a",
       "title": "Hoan thien tinh nang A",
       "startPercent": 0,
-      "dailyIncreaseRange": [
-        5,
-        10
-      ],
-      "maxPercent": 100
-    },
-    {
-      "title": "Kiem thu va sua loi tinh nang B",
-      "startPercent": 20,
-      "dailyIncrease": 5,
+      "dailyIncreaseRange": [5, 10],
       "maxPercent": 100
     }
   ],
   "pending": [],
-  "innovations": [],
-  "auth": {
-    "common": {
-      "clientId": "",
-      "redirectUri": "https://teams.cloud.microsoft/v2/authv2",
-      "brkClientId": "",
-      "brkRedirectUri": "https://teams.cloud.microsoft/v2/authv2",
-      "includeBrkFields": false,
-      "anchorMailbox": "",
-      "refreshToken": ""
-    },
-    "spaces": {
-      "scope": "https://api.spaces.skype.com/.default openid profile offline_access",
-      "storeTokenInMember": true,
-      "reusePrimaryRefreshToken": true
-    },
-    "substrate": {
-      "scope": "https://substrate.office.com/.default openid profile offline_access",
-      "storeTokenInMember": true,
-      "reusePrimaryRefreshToken": true
-    },
-    "ic3": {
-      "scope": "https://ic3.teams.office.com/.default openid profile offline_access",
-      "storeTokenInMember": true,
-      "reusePrimaryRefreshToken": true,
-      "claims": {
-        "access_token": {
-          "xms_cc": {
-            "values": [
-              "CP1"
-            ]
-          }
-        }
-      }
-    }
-  }
+  "innovations": []
 }

@@ -5,11 +5,10 @@
 .browser-profiles
 .env
 env.json
-token.json
-tokens
-members/*.json
-members/*/config.json
-members/*/state.json
+users
+groups
+audit
+.backups
 *.tmp
 tmp.json
 node_modules

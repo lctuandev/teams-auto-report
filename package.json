@@ -9,9 +9,13 @@
     "node": ">=20"
   },
   "scripts": {
+    "data:normalize": "node scripts/normalize-user-configs.js",
     "start": "node auto_report.js",
     "watch": "node auto_report.js --watch",
     "check": "node --check auto_report.js",
+    "test": "node --test test/*.test.js",
+    "backup:data": "node scripts/backup-data.js",
+    "restore:data": "node scripts/restore-data.js",
     "dry-run": "node auto_report.js --dry-run",
     "renew-token": "node auto_report.js --renew-token",
     "test-auth:spaces": "node auto_report.js --test-auth spaces",
