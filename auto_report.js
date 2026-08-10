@@ -7,6 +7,7 @@ const ROOT = __dirname;
 const EMPTY_CELL = "&nbsp;";
 const AUTH_KEEPALIVE_PROFILES = ["spaces", "substrate", "ic3"];
 const PARENT_POST_CACHE_FILE = path.join(ROOT, ".state", "parent-posts.json");
+const REPORT_QUEUE_DIRECTORY = path.join(ROOT, ".state", "report-queues");
 const MEMBER_STATE_KEYS = ["parentPosts", "postedReports", "dailyPlans", "monthlyReports", "browserRenewals"];
 const DEFAULT_REPORT_NUMBER_TEMPLATE = "T{MM}/{REPORT_INDEX}/{MONTH_WORKDAYS}";
 const DAY_INDEX = {
@@ -118,6 +119,8 @@ async function main() {
       if (!args["dry-run"] && !args.dryRun) {
         releaseLock = acquireMemberRunLock(member.config.id);
         activeMember = loadMemberConfigs(member.config.id)[0];
+        await processQueuedReportsForMember(activeMember);
+        activeMember = loadMemberConfigs(member.config.id)[0];
       }
       await runPipelineForMember(activeMember, args);
     } catch (error) {
@@ -137,6 +140,11 @@ async function main() {
 
 async function runPipelineForMember(member, args) {
   const config = member.config;
+  const persistentTasks = config.tasks;
+  const usesIsolatedTasks = Array.isArray(args.reportTasks);
+  if (usesIsolatedTasks) {
+    config.tasks = JSON.parse(JSON.stringify(args.reportTasks));
+  }
   const dryRun = Boolean(args["dry-run"] || args.dryRun);
   const force = Boolean(args.force);
   const timezone = args.timezone || config.schedule?.timezone || process.env.REPORT_TIMEZONE || "Asia/Bangkok";
@@ -144,7 +152,10 @@ async function runPipelineForMember(member, args) {
   const now = new Date();
   const reportDate = args.date ? parseDate(args.date) : getDatePartsInTimezone(now, timezone);
   const reportDateIso = formatIsoDate(reportDate);
-  const title = renderTemplate(config.teams.searchTitleTemplate, reportDate, config);
+  const title = args.searchTitle || renderTemplate(config.teams.searchTitleTemplate, reportDate, config);
+  if (args.backfill) {
+    Object.defineProperty(config, "__backfill", { value: true, enumerable: false, configurable: true });
+  }
   let pipelineStage = "report";
 
   if (!force && !dryRun) {
@@ -180,7 +191,12 @@ async function runPipelineForMember(member, args) {
   }
 
   if (!force && !dryRun) {
-    pipelineStage = getPipelineStage(config, reportDate, now, timezone);
+    if (args.backfill) {
+      assertPostDayAllowed(config, reportDate);
+      pipelineStage = "report";
+    } else {
+      pipelineStage = getPipelineStage(config, reportDate, now, timezone);
+    }
     if (pipelineStage === "skip") {
       return;
     }
@@ -253,7 +269,9 @@ async function runPipelineForMember(member, args) {
   const existingReply = findExistingReportReply(config, parentPost, reportDate);
   if (!dryRun && existingReply) {
     console.log(`[INFO][${config.id}] Report reply already exists in parent post. Marking ${reportDateIso} as checked.`);
-    const progressUpdates = updateTaskProgressAfterPost(config, reportDate);
+    const progressUpdates = (usesIsolatedTasks || shouldUpdateTaskProgress(config, reportDateIso))
+      ? updateTaskProgressAfterPost(config, reportDate)
+      : [];
     markReportChecked(config, {
       reportDateIso,
       title,
@@ -268,9 +286,9 @@ async function runPipelineForMember(member, args) {
           null
       }
     });
-    persistMember(member);
+    const reportTasks = persistPipelineResult(member, persistentTasks, usesIsolatedTasks);
     console.log(`[INFO][${config.id}] Updated member progress for ${progressUpdates.length} task(s).`);
-    return;
+    return { reportTasks };
   }
 
   const content = buildReportHtml(config, reportDate);
@@ -301,7 +319,9 @@ async function runPipelineForMember(member, args) {
   console.log(`[INFO][${config.id}] Posted report reply successfully.`);
   console.log(JSON.stringify(result, null, 2));
 
-  const progressUpdates = updateTaskProgressAfterPost(config, reportDate);
+  const progressUpdates = (usesIsolatedTasks || shouldUpdateTaskProgress(config, reportDateIso))
+    ? updateTaskProgressAfterPost(config, reportDate)
+    : [];
   markReportChecked(config, {
     reportDateIso,
     title,
@@ -309,8 +329,109 @@ async function runPipelineForMember(member, args) {
     threadId,
     result
   });
-  persistMember(member);
+  const reportTasks = persistPipelineResult(member, persistentTasks, usesIsolatedTasks);
   console.log(`[INFO][${config.id}] Updated member progress for ${progressUpdates.length} task(s).`);
+  return { reportTasks };
+}
+
+function persistPipelineResult(member, persistentTasks, usesIsolatedTasks) {
+  const reportTasks = usesIsolatedTasks
+    ? JSON.parse(JSON.stringify(member.config.tasks))
+    : null;
+  if (usesIsolatedTasks) member.config.tasks = persistentTasks;
+  persistMember(member);
+  return reportTasks;
+}
+
+async function processQueuedReportsForMember(member) {
+  const queueFilePath = getReportQueueFilePath(member.config.id);
+  if (!fs.existsSync(queueFilePath)) return;
+
+  let queue = readReportQueue(queueFilePath, member.config.id);
+  const pendingItems = queue.items
+    .filter((item) => item.status === "queued" || item.status === "processing")
+    .sort((left, right) => left.date.localeCompare(right.date) || left.createdAt.localeCompare(right.createdAt));
+
+  for (const pendingItem of pendingItems) {
+    queue = readReportQueue(queueFilePath, member.config.id);
+    const item = queue.items.find((candidate) => candidate.id === pendingItem.id);
+    if (!item || (item.status !== "queued" && item.status !== "processing")) continue;
+
+    item.status = "processing";
+    item.updatedAt = new Date().toISOString();
+    delete item.error;
+    writeJson(queueFilePath, queue);
+    console.log(`[QUEUE][${member.config.id}] Processing past report ${item.date}.`);
+
+    try {
+      const activeMember = loadMemberConfigs(member.config.id)[0];
+      const timezone = activeMember.config.schedule?.timezone || process.env.REPORT_TIMEZONE || "Asia/Bangkok";
+      const todayIso = formatIsoDate(getDatePartsInTimezone(new Date(), timezone));
+      if (item.date >= todayIso) {
+        throw new Error(`Queued report date ${item.date} must be earlier than ${todayIso}.`);
+      }
+      if (!Array.isArray(item.tasks) || !item.tasks.length) {
+        throw new Error("Queued past report has no isolated tasks. Add the date to queue again with a new task list.");
+      }
+      const reportTasks = item.tasks.map((task) => ({
+        ...task,
+        // A queue item represents exactly one report step. Anchoring the
+        // isolated task to this date applies one increase even when selected
+        // report dates are not consecutive workdays.
+        progressStartDate: item.date
+      }));
+      const result = await runPipelineForMember(activeMember, {
+        date: item.date,
+        backfill: true,
+        reportTasks
+      });
+      queue = readReportQueue(queueFilePath, member.config.id);
+      const completedItem = queue.items.find((candidate) => candidate.id === item.id);
+      if (completedItem) {
+        if (Array.isArray(result?.reportTasks)) {
+          completedItem.tasks = result.reportTasks;
+          for (const nextItem of queue.items) {
+            if (
+              nextItem.id !== completedItem.id &&
+              nextItem.batchId &&
+              nextItem.batchId === completedItem.batchId &&
+              nextItem.status === "queued"
+            ) {
+              nextItem.tasks = JSON.parse(JSON.stringify(result.reportTasks));
+              nextItem.updatedAt = new Date().toISOString();
+            }
+          }
+        }
+        completedItem.status = "completed";
+        completedItem.completedAt = new Date().toISOString();
+        completedItem.updatedAt = completedItem.completedAt;
+        delete completedItem.error;
+        writeJson(queueFilePath, queue);
+      }
+    } catch (error) {
+      queue = readReportQueue(queueFilePath, member.config.id);
+      const failedItem = queue.items.find((candidate) => candidate.id === item.id);
+      if (failedItem) {
+        failedItem.status = "failed";
+        failedItem.updatedAt = new Date().toISOString();
+        failedItem.error = String(error?.message || error).slice(0, 2000);
+        writeJson(queueFilePath, queue);
+      }
+      console.error(`[QUEUE][${member.config.id}] Past report ${item.date} failed: ${error.message}`);
+    }
+  }
+}
+
+function getReportQueueFilePath(memberId) {
+  return path.join(REPORT_QUEUE_DIRECTORY, `${sanitizeFileName(memberId)}.json`);
+}
+
+function readReportQueue(filePath, memberId) {
+  const queue = readJson(filePath);
+  if (!queue || queue.version !== 1 || !Array.isArray(queue.items)) {
+    throw new Error(`Invalid report queue for member ${memberId}.`);
+  }
+  return queue;
 }
 
 function loadMemberConfigs(memberFilter, rootDir = ROOT) {
@@ -2704,6 +2825,12 @@ function updateTaskProgressAfterPost(config, reportDate) {
   });
 }
 
+function shouldUpdateTaskProgress(config, reportDateIso) {
+  return !Object.entries(config.postedReports || {}).some(
+    ([dateIso, report]) => dateIso > reportDateIso && report?.checked
+  );
+}
+
 function buildPendingRows(items = [], secondKey, minRows) {
   const normalized = [...items];
   while (normalized.length < minRows) {
@@ -2870,6 +2997,16 @@ function getNextReportIndex(config, reportDate, monthlyReport) {
     ? Math.max(...explicitPriorIndexes) + 1
     : baseReportedWorkdays + 1;
   const nextSequentialIndex = baseReportedWorkdays + checkedBefore.length + 1;
+
+  if (config.__backfill) {
+    const allExplicitIndexes = getCheckedReportDatesForMonth(config, monthKey)
+      .map((dateIso) => Number(config.postedReports?.[dateIso]?.reportIndex))
+      .filter(Number.isFinite);
+    const nextAvailableIndex = allExplicitIndexes.length
+      ? Math.max(...allExplicitIndexes) + 1
+      : baseReportedWorkdays + getCheckedReportDatesForMonth(config, monthKey).length + 1;
+    return Math.max(nextAvailableIndex, nextSequentialIndex);
+  }
 
   return Math.max(nextExplicitIndex, nextSequentialIndex);
 }
@@ -3100,6 +3237,7 @@ function markParentPostChecked(config, reportDateIso, parentPost, source) {
 module.exports = {
   buildDryRunParentPost,
   getParentPostCacheKey,
+  getNextReportIndex,
   getOrCreateMonthlyReport,
   getReportableTasks,
   getUsablePreviousRefreshTokenExpiry,
@@ -3107,11 +3245,13 @@ module.exports = {
   loadMemberConfigs,
   persistMember,
   persistCredentials,
+  persistPipelineResult,
   resolveMemberGroupConfig,
   saveTokenForConfig,
   saveBrowserRefreshToken,
   shouldRetryBrowserRenewAfterRuntimeFix,
   shouldRefreshAuthCache,
+  shouldUpdateTaskProgress,
   splitMemberConfigAndState
 };
 

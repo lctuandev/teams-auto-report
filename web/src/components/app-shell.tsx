@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
   ClipboardList,
+  CalendarClock,
   LayoutDashboard,
   Layers3,
   ListTodo,
@@ -29,6 +30,7 @@ import { cn } from "@/lib/utils";
 
 const navigation = [
   { href: "/", label: "Tổng quan", icon: LayoutDashboard },
+  { href: "/me/past-reports", label: "Báo cáo ngày cũ", icon: CalendarClock },
   { href: "/me/tasks", label: "Task của tôi", icon: ListTodo },
   { href: "/me/report-config", label: "Cấu hình report", icon: Settings2 },
   { href: "/groups", label: "Groups", icon: Layers3 },

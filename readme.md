@@ -650,6 +650,26 @@ Report reply:
 
 ## Lệnh Chạy
 
+### Queue báo cáo ngày đã qua
+
+Trang `/me/past-reports` hiển thị lịch các ngày làm việc đã qua nhưng chưa có trong
+`postedReports`. Người dùng có thể chọn một hoặc nhiều ngày và thêm vào queue.
+
+Queue của từng member được lưu tại `.state/report-queues/<member_id>.json`, là volume
+dùng chung giữa `report-web` và `teams-report`. Ở mỗi lượt chạy, bot xử lý các mục
+`queued` theo ngày tăng dần bằng cùng logic search/create parent post và chống reply
+trùng của báo cáo tự động. UI tự cập nhật các trạng thái `queued`, `processing`,
+`completed` và `failed`; mục lỗi có thể được chọn lại để retry.
+
+Mỗi lần thêm queue tạo một batch với danh sách task riêng. Task này không đọc và
+không ghi đè `config.json -> tasks` của báo cáo hằng ngày. Sau khi một ngày trong
+batch được đăng thành công, tiến độ task riêng được tăng theo `dailyIncrease` hoặc
+`dailyIncreaseRange` đúng một lần rồi truyền sang ngày kế tiếp của chính batch đó.
+
+Backfill chạy ngay khi worker nhận queue, không chờ `postAfterTime` và không bao giờ
+cập nhật tiến độ task hằng ngày trong `config.json`. Số báo cáo dùng index chưa sử
+dụng tiếp theo trong tháng để tránh trùng với báo cáo đã đăng.
+
 Check syntax:
 
 ```bash

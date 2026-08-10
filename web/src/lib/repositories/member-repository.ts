@@ -74,6 +74,34 @@ export class MemberRepository {
     };
   }
 
+  async getPastReportData(memberId: string) {
+    const id = resourceIdSchema.parse(memberId);
+    const [config, state] = await Promise.all([
+      readJson(resolveInsideDataRoot("users", id, "config.json"), memberConfigSchema),
+      readJson(resolveInsideDataRoot("users", id, "state.json"), memberStateSchema),
+    ]);
+    if (config.id !== id) throw new Error("Member directory and config ID do not match");
+
+    return {
+      memberId: id,
+      tasks: config.tasks.map((task) => ({
+        id: task.id ?? null,
+        title: task.title,
+        startPercent: task.startPercent,
+        maxPercent: task.maxPercent,
+      })),
+      postedDates: Object.entries(state.postedReports)
+        .filter(([, value]) => value && typeof value === "object" && (value as Record<string, unknown>).checked === true)
+        .map(([date]) => date),
+      skipDates: Array.isArray(config.report.skipDates)
+        ? config.report.skipDates.filter((date): date is string => typeof date === "string")
+        : [],
+      extraWorkDates: Array.isArray(config.report.extraWorkDates)
+        ? config.report.extraWorkDates.filter((date): date is string => typeof date === "string")
+        : [],
+    };
+  }
+
   async getHistory(memberId: string, page = 1, pageSize = 20) {
     const id = resourceIdSchema.parse(memberId);
     const safePage = Math.max(1, Math.floor(page));

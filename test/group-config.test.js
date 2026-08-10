@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { buildDryRunParentPost, getOrCreateMonthlyReport, getParentPostCacheKey, getReportableTasks, getUsablePreviousRefreshTokenExpiry, isAllowedDay, loadMemberConfigs, persistCredentials, persistMember, resolveMemberGroupConfig, saveBrowserRefreshToken, saveTokenForConfig, shouldRetryBrowserRenewAfterRuntimeFix, shouldRefreshAuthCache, splitMemberConfigAndState } = require("../auto_report");
+const { buildDryRunParentPost, getNextReportIndex, getOrCreateMonthlyReport, getParentPostCacheKey, getReportableTasks, getUsablePreviousRefreshTokenExpiry, isAllowedDay, loadMemberConfigs, persistCredentials, persistMember, persistPipelineResult, resolveMemberGroupConfig, saveBrowserRefreshToken, saveTokenForConfig, shouldRetryBrowserRenewAfterRuntimeFix, shouldRefreshAuthCache, shouldUpdateTaskProgress, splitMemberConfigAndState } = require("../auto_report");
 
 test("group config supplies parent settings without persisting them into member config", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "teams-report-group-"));
@@ -93,6 +93,34 @@ test("completed tasks remain reportable by default and are filtered only when en
     getReportableTasks({ tasks, report: { excludeCompletedTasks: true } }),
     [tasks[1]],
   );
+});
+
+test("backfill uses the next unused report index and does not regress newer task progress", () => {
+  const config = {
+    __backfill: true,
+    postedReports: {
+      "2026-08-03": { checked: true, reportIndex: 1 },
+      "2026-08-05": { checked: true, reportIndex: 2 },
+    },
+  };
+  assert.equal(getNextReportIndex(config, { year: 2026, month: 8, day: 4 }, { baseReportedWorkdays: 0 }), 3);
+  assert.equal(shouldUpdateTaskProgress(config, "2026-08-04"), false);
+  assert.equal(shouldUpdateTaskProgress(config, "2026-08-06"), true);
+});
+
+test("isolated backfill tasks are returned without replacing persistent member tasks", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "teams-report-isolated-tasks-"));
+  const filePath = path.join(root, "member.json");
+  const persistentTasks = [{ id: "daily", title: "Daily task", startPercent: 80 }];
+  const isolatedTasks = [{ id: "backfill", title: "Past task", startPercent: 15 }];
+  const member = { filePath, config: { id: "member_one", tasks: isolatedTasks } };
+
+  const result = persistPipelineResult(member, persistentTasks, true);
+  const stored = JSON.parse(fs.readFileSync(filePath, "utf8"));
+
+  assert.deepEqual(result, isolatedTasks);
+  assert.deepEqual(stored.tasks, persistentTasks);
+  assert.deepEqual(member.config.tasks, persistentTasks);
 });
 
 test("access token keepalive does not refresh a healthy one-hour token every watch loop", () => {
