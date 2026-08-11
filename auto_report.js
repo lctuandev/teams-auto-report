@@ -540,6 +540,11 @@ function shouldLoadMember(config, memberFilter, fallbackId) {
     return false;
   }
 
+  if (!Array.isArray(config.tasks) || config.tasks.length === 0) {
+    console.log(`[INFO][${config.id}] Skipped member with no tasks.`);
+    return false;
+  }
+
   return true;
 }
 
