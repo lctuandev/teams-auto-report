@@ -64,7 +64,10 @@ async function main() {
     return;
   }
 
-  const members = loadMemberConfigs(args.member);
+  // test-auth and renew-token are auth/login operations and must work for a
+  // member that has no daily tasks configured yet (e.g. a brand-new member
+  // being onboarded via the web UI's browser-login button).
+  const members = loadMemberConfigs(args.member, ROOT, { requireTasks: false });
 
   if (args["test-auth"]) {
     for (const member of members) {
@@ -112,17 +115,28 @@ async function main() {
   }
 
   let hasFailure = false;
-  for (const member of members) {
+  // Backfill queue processing must not depend on whether a member has
+  // persistent daily tasks configured — a member with no current daily
+  // tasks can still have past-report backfill items waiting in their
+  // queue, and those would otherwise never be picked up.
+  const operationalMembers = loadMemberConfigs(args.member, ROOT, { requireTasks: false });
+  for (const member of operationalMembers) {
     let releaseLock = null;
     try {
       let activeMember = member;
       if (!args["dry-run"] && !args.dryRun) {
         releaseLock = acquireMemberRunLock(member.config.id);
-        activeMember = loadMemberConfigs(member.config.id)[0];
+        activeMember = loadMemberConfigs(member.config.id, ROOT, { requireTasks: false })[0];
         await processQueuedReportsForMember(activeMember);
-        activeMember = loadMemberConfigs(member.config.id)[0];
+        activeMember = loadMemberConfigs(member.config.id, ROOT, { requireTasks: false })[0];
       }
-      await runPipelineForMember(activeMember, args);
+      // With excludeCompletedTasks enabled, a member whose tasks are all at
+      // 100% has nothing left to report; posting would produce an empty row.
+      if (getReportableTasks(activeMember.config).length > 0) {
+        await runPipelineForMember(activeMember, args);
+      } else {
+        console.log(`[INFO][${activeMember.config.id}] Skipped daily pipeline: no reportable tasks.`);
+      }
     } catch (error) {
       hasFailure = true;
       console.error(`[ERROR][${member.config.id}] ${error.message}`);
@@ -364,7 +378,7 @@ async function processQueuedReportsForMember(member) {
     console.log(`[QUEUE][${member.config.id}] Processing past report ${item.date}.`);
 
     try {
-      const activeMember = loadMemberConfigs(member.config.id)[0];
+      const activeMember = loadMemberConfigs(member.config.id, ROOT, { requireTasks: false })[0];
       const timezone = activeMember.config.schedule?.timezone || process.env.REPORT_TIMEZONE || "Asia/Bangkok";
       const todayIso = formatIsoDate(getDatePartsInTimezone(new Date(), timezone));
       if (item.date >= todayIso) {
@@ -434,7 +448,7 @@ function readReportQueue(filePath, memberId) {
   return queue;
 }
 
-function loadMemberConfigs(memberFilter, rootDir = ROOT) {
+function loadMemberConfigs(memberFilter, rootDir = ROOT, options = {}) {
   const usersDir = path.join(rootDir, "users");
   if (!fs.existsSync(usersDir)) {
     throw new Error("users folder was not found.");
@@ -457,7 +471,7 @@ function loadMemberConfigs(memberFilter, rootDir = ROOT) {
     const stateFilePath = path.join(memberDir, "state.json");
     const credentialsFilePath = path.join(memberDir, "credentials.json");
     const config = loadSplitMemberConfig(configFilePath, stateFilePath, credentialsFilePath, dirName, rootDir);
-    if (!shouldLoadMember(config, memberFilter, dirName)) {
+    if (!shouldLoadMember(config, memberFilter, dirName, options)) {
       continue;
     }
 
@@ -530,7 +544,9 @@ function resolveMemberGroupConfig(config, rootDir = ROOT) {
   return config;
 }
 
-function shouldLoadMember(config, memberFilter, fallbackId) {
+function shouldLoadMember(config, memberFilter, fallbackId, options = {}) {
+  const { requireTasks = true } = options;
+
   if (memberFilter && config.id !== memberFilter && fallbackId !== memberFilter) {
     return false;
   }
@@ -540,7 +556,7 @@ function shouldLoadMember(config, memberFilter, fallbackId) {
     return false;
   }
 
-  if (!Array.isArray(config.tasks) || config.tasks.length === 0) {
+  if (requireTasks && (!Array.isArray(config.tasks) || config.tasks.length === 0)) {
     console.log(`[INFO][${config.id}] Skipped member with no tasks.`);
     return false;
   }
@@ -2772,8 +2788,15 @@ function buildTaskRows(config, reportDate) {
 
 function getReportableTasks(config = {}) {
   const tasks = Array.isArray(config.tasks) ? config.tasks : [];
+  // Past reports post the exact task list queued for that date, so the
+  // daily-only excludeCompletedTasks filter does not apply to them.
+  if (config.__backfill) return tasks;
   if (config.report?.excludeCompletedTasks !== true) return tasks;
-  return tasks.filter((task) => Number(task?.startPercent || 0) < 100);
+  return tasks.filter((task) => !isTaskCompleted(task));
+}
+
+function isTaskCompleted(task) {
+  return Number(task?.startPercent || 0) >= 100;
 }
 
 function getReportNumber(config, reportDate) {
