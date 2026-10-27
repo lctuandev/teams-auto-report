@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const os = require("os");
 const { spawn } = require("child_process");
 
 const ROOT = __dirname;
@@ -8,6 +9,7 @@ const EMPTY_CELL = "&nbsp;";
 const AUTH_KEEPALIVE_PROFILES = ["spaces", "substrate", "ic3"];
 const PARENT_POST_CACHE_FILE = path.join(ROOT, ".state", "parent-posts.json");
 const REPORT_QUEUE_DIRECTORY = path.join(ROOT, ".state", "report-queues");
+const CATCH_UP_QUEUE_DIRECTORY = path.join(ROOT, ".state", "catch-up-queues");
 const MEMBER_STATE_KEYS = ["parentPosts", "postedReports", "dailyPlans", "monthlyReports", "browserRenewals"];
 const DEFAULT_REPORT_NUMBER_TEMPLATE = "T{MM}/{REPORT_INDEX}/{MONTH_WORKDAYS}";
 const DAY_INDEX = {
@@ -114,6 +116,17 @@ async function main() {
     return;
   }
 
+  if (args["catch-up"]) {
+    await runCatchUpFromCli(args);
+    return;
+  }
+
+  // A catch-up for a missed day must run before today's daily pipeline so the
+  // missed day still advances daily task progress.
+  if (!args.member && !args["dry-run"] && !args.dryRun) {
+    await processCatchUpQueues();
+  }
+
   let hasFailure = false;
   // Backfill queue processing must not depend on whether a member has
   // persistent daily tasks configured — a member with no current daily
@@ -205,7 +218,7 @@ async function runPipelineForMember(member, args) {
   }
 
   if (!force && !dryRun) {
-    if (args.backfill) {
+    if (args.backfill || args.catchUp) {
       assertPostDayAllowed(config, reportDate);
       pipelineStage = "report";
     } else {
@@ -243,7 +256,8 @@ async function runPipelineForMember(member, args) {
       config,
       accessToken,
       (token) => findOrCreateParentPost(config, token, title, reportDateIso, {
-        allowCreate: !dryRun
+        allowCreate: !dryRun && !args.catchUp,
+        requireExisting: Boolean(args.catchUp)
       }),
       postProfileKey
     );
@@ -434,6 +448,161 @@ async function processQueuedReportsForMember(member) {
       console.error(`[QUEUE][${member.config.id}] Past report ${item.date} failed: ${error.message}`);
     }
   }
+}
+
+async function runCatchUpFromCli(args) {
+  const dateIso = String(args["catch-up"]);
+  parseDate(dateIso);
+  const dryRun = Boolean(args["dry-run"] || args.dryRun);
+  const members = loadMemberConfigs(args.member, ROOT, { requireTasks: false });
+  const results = [];
+  for (const member of members) {
+    results.push(await runCatchUpForMember(member.config.id, dateIso, { dryRun }));
+  }
+
+  for (const result of results) {
+    console.log(`[CATCH_UP][${result.memberId}] ${result.status}: ${result.message}`);
+  }
+  if (results.some((result) => result.status === "failed")) {
+    process.exitCode = 1;
+  }
+}
+
+async function processCatchUpQueues() {
+  if (!fs.existsSync(CATCH_UP_QUEUE_DIRECTORY)) return;
+
+  const queueFiles = fs.readdirSync(CATCH_UP_QUEUE_DIRECTORY)
+    .filter((fileName) => fileName.endsWith(".json"))
+    .map((fileName) => path.join(CATCH_UP_QUEUE_DIRECTORY, fileName));
+  for (const queueFilePath of queueFiles) {
+    try {
+      await processCatchUpQueue(queueFilePath);
+    } catch (error) {
+      console.error(`[CATCH_UP] Could not process ${path.basename(queueFilePath)}: ${error.message}`);
+    }
+  }
+}
+
+// Each group has its own queue file, written by the web UI.
+async function processCatchUpQueue(queueFilePath) {
+  const pendingItems = readCatchUpQueue(queueFilePath).items
+    .filter((item) => item.status === "queued" || item.status === "processing")
+    .sort((left, right) => left.date.localeCompare(right.date) || left.createdAt.localeCompare(right.createdAt));
+
+  for (const pendingItem of pendingItems) {
+    updateCatchUpItem(queueFilePath, pendingItem.id, (item) => {
+      item.status = "processing";
+      item.results = [];
+      delete item.error;
+    });
+    console.log(`[CATCH_UP][${pendingItem.groupId}] Processing catch-up report ${pendingItem.date}.`);
+
+    const results = [];
+    let error = null;
+    try {
+      const members = loadMemberConfigs(null, ROOT, { requireTasks: false })
+        .filter((member) => member.config.groupId === pendingItem.groupId);
+      for (const member of members) {
+        results.push(await runCatchUpForMember(member.config.id, pendingItem.date));
+      }
+    } catch (caught) {
+      error = String(caught?.message || caught);
+    }
+
+    const failedCount = results.filter((result) => result.status === "failed").length;
+    if (!error && failedCount) {
+      error = `${failedCount} member(s) failed.`;
+    }
+    updateCatchUpItem(queueFilePath, pendingItem.id, (item) => {
+      item.status = error ? "failed" : "completed";
+      item.results = results;
+      item.completedAt = new Date().toISOString();
+      if (error) item.error = error.slice(0, 2000);
+    });
+    console.log(`[CATCH_UP][${pendingItem.groupId}] Catch-up report ${pendingItem.date} ${error ? `failed: ${error}` : "completed"}.`);
+  }
+}
+
+// Posts a missed day the way the daily pipeline would have: persistent daily
+// tasks, daily progress applied, and only into a parent post that already exists.
+async function runCatchUpForMember(memberId, dateIso, options = {}) {
+  const dryRun = Boolean(options.dryRun);
+  let releaseLock = null;
+  try {
+    if (!dryRun) {
+      releaseLock = acquireMemberRunLock(memberId);
+    }
+    const member = loadMemberConfigs(memberId, ROOT, { requireTasks: false })[0];
+    if (!member) {
+      return { memberId, status: "skipped", message: "Member is disabled or was not found." };
+    }
+
+    const skipReason = getCatchUpSkipReason(member.config, dateIso);
+    if (skipReason) {
+      console.log(`[CATCH_UP][${memberId}] Skipped ${dateIso}: ${skipReason}`);
+      return { memberId, status: "skipped", message: skipReason };
+    }
+
+    await runPipelineForMember(member, { date: dateIso, catchUp: true, dryRun });
+    if (dryRun) {
+      return { memberId, status: "dry-run", message: `Would post report ${dateIso}.` };
+    }
+
+    const reloaded = loadMemberConfigs(memberId, ROOT, { requireTasks: false })[0];
+    if (!reloaded?.config.postedReports?.[dateIso]?.checked) {
+      return { memberId, status: "failed", message: "Pipeline finished without marking the report as posted." };
+    }
+    return { memberId, status: "posted", message: `Posted report ${dateIso}.` };
+  } catch (error) {
+    console.error(`[CATCH_UP][${memberId}] ${error.message}`);
+    return { memberId, status: "failed", message: String(error.message || error).slice(0, 1000) };
+  } finally {
+    if (releaseLock) {
+      releaseLock();
+    }
+  }
+}
+
+function getCatchUpSkipReason(config, dateIso, now = new Date()) {
+  const timezone = config.schedule?.timezone || process.env.REPORT_TIMEZONE || "Asia/Bangkok";
+  const todayIso = formatIsoDate(getDatePartsInTimezone(now, timezone));
+  if (dateIso >= todayIso) {
+    return `Catch-up date ${dateIso} must be earlier than ${todayIso}.`;
+  }
+  if (!isAllowedDay(config, parseDate(dateIso))) {
+    return `${dateIso} is not a report day for this member.`;
+  }
+  if (config.postedReports?.[dateIso]?.checked) {
+    return `Report ${dateIso} was already posted.`;
+  }
+  // Daily progress only moves forward, so a missed day cannot be inserted
+  // behind a report that was already posted.
+  const laterDateIso = Object.keys(config.postedReports || {})
+    .filter((reportDateIso) => reportDateIso > dateIso && config.postedReports[reportDateIso]?.checked)
+    .sort()[0];
+  if (laterDateIso) {
+    return `A later report (${laterDateIso}) is already posted. Use past reports for ${dateIso} instead.`;
+  }
+  if (getReportableTasks(config).length === 0) {
+    return "No reportable daily tasks.";
+  }
+  return null;
+}
+
+function readCatchUpQueue(queueFilePath) {
+  if (!fs.existsSync(queueFilePath)) return { version: 1, items: [] };
+  const queue = readJson(queueFilePath);
+  return { version: 1, items: Array.isArray(queue?.items) ? queue.items : [] };
+}
+
+// Re-read before every write so requests the web UI appended meanwhile survive.
+function updateCatchUpItem(queueFilePath, itemId, update) {
+  const queue = readCatchUpQueue(queueFilePath);
+  const item = queue.items.find((candidate) => candidate.id === itemId);
+  if (!item) return;
+  update(item);
+  item.updatedAt = new Date().toISOString();
+  writeJson(queueFilePath, queue);
 }
 
 function getReportQueueFilePath(memberId) {
@@ -758,7 +927,8 @@ function stripWatchOnlyArgs(rawArgs) {
     "parent-message-id",
     "thread-id",
     "test-auth",
-    "renew-token"
+    "renew-token",
+    "catch-up"
   ]);
   const stripped = [];
 
@@ -1416,6 +1586,7 @@ async function renewRefreshTokenWithBrowser(config = {}, options = {}) {
     "https://teams.cloud.microsoft/";
 
   fs.mkdirSync(profileDir, { recursive: true });
+  clearStaleBrowserProfileLock(profileDir, config.id);
   console.log(
     `[INFO][${config.id}] Browser token renew started (${options.reason || "renew"}). Profile: ${path.relative(ROOT, profileDir) || profileDir}`
   );
@@ -1530,6 +1701,37 @@ function loadPlaywright() {
       );
     }
   }
+}
+
+// Chrome refuses to open a profile whose SingletonLock ("<host>-<pid>") survived
+// a crash or a Docker container that no longer exists. Only a live process on
+// this same host is treated as a real owner; everything else is stale.
+function clearStaleBrowserProfileLock(profileDir, memberId) {
+  const lockPath = path.join(profileDir, "SingletonLock");
+  let lockTarget;
+  try {
+    lockTarget = fs.readlinkSync(lockPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+
+  const separatorIndex = lockTarget.lastIndexOf("-");
+  const lockHost = lockTarget.slice(0, separatorIndex);
+  const lockPid = Number(lockTarget.slice(separatorIndex + 1));
+  if (lockHost === os.hostname() && Number.isInteger(lockPid) && lockPid > 0) {
+    try {
+      process.kill(lockPid, 0);
+      throw new Error(`Browser profile ${profileDir} is in use by running process ${lockPid}. Close that Chrome window first.`);
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+  }
+
+  for (const name of ["SingletonLock", "SingletonCookie", "SingletonSocket"]) {
+    fs.rmSync(path.join(profileDir, name), { force: true });
+  }
+  console.warn(`[WARN][${memberId}] Removed stale browser profile lock (${lockTarget}).`);
 }
 
 function getBrowserProfileDir(config = {}) {
@@ -2277,7 +2479,7 @@ async function findOrCreateParentPost(config, accessToken, title, reportDateIso,
     }
 
     const parentPost = await searchOrCreateParentPostUnderLock(config, accessToken, title, reportDateIso, options);
-    if (options.allowCreate !== false) {
+    if (options.allowCreate !== false || options.requireExisting) {
       writeGlobalParentPost(parentCacheKey, parentPost);
     }
     return parentPost;
@@ -2303,6 +2505,10 @@ async function searchOrCreateParentPostUnderLock(config, accessToken, title, rep
   } catch (error) {
     if (!String(error.message || "").startsWith("Could not find parent post")) {
       throw error;
+    }
+
+    if (options.requireExisting) {
+      throw new Error(`Parent post for ${reportDateIso} was not found: ${title}. Catch-up never creates a parent post.`);
     }
 
     if (options.allowCreate === false) {
@@ -3264,6 +3470,7 @@ function markParentPostChecked(config, reportDateIso, parentPost, source) {
 
 module.exports = {
   buildDryRunParentPost,
+  getCatchUpSkipReason,
   getParentPostCacheKey,
   getNextReportIndex,
   getOrCreateMonthlyReport,

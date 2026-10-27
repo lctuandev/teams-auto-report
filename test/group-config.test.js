@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const { buildDryRunParentPost, getNextReportIndex, getOrCreateMonthlyReport, getParentPostCacheKey, getReportableTasks, getUsablePreviousRefreshTokenExpiry, isAllowedDay, loadMemberConfigs, persistCredentials, persistMember, persistPipelineResult, resolveMemberGroupConfig, saveBrowserRefreshToken, saveTokenForConfig, shouldRetryBrowserRenewAfterRuntimeFix, shouldRefreshAuthCache, shouldUpdateTaskProgress, splitMemberConfigAndState } = require("../auto_report");
+const { buildDryRunParentPost, getCatchUpSkipReason, getNextReportIndex, getOrCreateMonthlyReport, getParentPostCacheKey, getReportableTasks, getUsablePreviousRefreshTokenExpiry, isAllowedDay, loadMemberConfigs, persistCredentials, persistMember, persistPipelineResult, resolveMemberGroupConfig, saveBrowserRefreshToken, saveTokenForConfig, shouldRetryBrowserRenewAfterRuntimeFix, shouldRefreshAuthCache, shouldUpdateTaskProgress, splitMemberConfigAndState } = require("../auto_report");
 
 test("group config supplies parent settings without persisting them into member config", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "teams-report-group-"));
@@ -265,4 +265,23 @@ test("bot member persistence increments config version", () => {
   const member = loadMemberConfigs("member_one", root)[0];
   persistMember(member);
   assert.equal(JSON.parse(fs.readFileSync(path.join(directory, "config.json"), "utf8")).version, 5);
+});
+
+test("catch-up only allows an unreported past report day with no later report", () => {
+  const now = new Date("2026-10-10T03:00:00Z");
+  const config = {
+    schedule: { timezone: "Asia/Ho_Chi_Minh", days: [1, 2, 3, 4, 5] },
+    report: {},
+    tasks: [{ title: "Daily task", startPercent: 40 }],
+    postedReports: { "2026-10-08": { checked: true } }
+  };
+  assert.equal(getCatchUpSkipReason(config, "2026-10-09", now), null);
+  assert.match(getCatchUpSkipReason(config, "2026-10-10", now), /must be earlier/);
+  assert.match(getCatchUpSkipReason(config, "2026-10-04", now), /not a report day/);
+  assert.match(getCatchUpSkipReason(config, "2026-10-08", now), /already posted/);
+  assert.match(getCatchUpSkipReason(config, "2026-10-07", now), /later report \(2026-10-08\)/);
+  assert.match(
+    getCatchUpSkipReason({ ...config, report: { excludeCompletedTasks: true }, tasks: [{ startPercent: 100 }] }, "2026-10-09", now),
+    /No reportable daily tasks/
+  );
 });
